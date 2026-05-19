@@ -125,9 +125,14 @@ jobs:
             git clone --depth 1 --branch 3.4 https://gitlab.com/libeigen/eigen.git eigen
           fi
 
-          # nanosvg (header-only).
+          # nanosvg (header-only). Upstream stashes the headers under src/,
+          # but the bridge expects `#include "nanosvg/nanosvg.h"` resolved
+          # against deps/nanosvg/ — mirror the headers into a sibling
+          # nanosvg/ subdir to satisfy that include.
           if [ ! -d nanosvg ]; then
             git clone --depth 1 https://github.com/memononen/nanosvg.git nanosvg
+            mkdir -p nanosvg/nanosvg
+            cp nanosvg/src/nanosvg.h nanosvg/src/nanosvgrast.h nanosvg/nanosvg/
           fi
 
           # nlohmann_json 3.11 (single header + bundled CMake config).

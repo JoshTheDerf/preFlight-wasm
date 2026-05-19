@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.10)
+project(heatshrink C)
+
+add_library(heatshrink_dynalloc STATIC
+    heatshrink_decoder.c
+    heatshrink_encoder.c
+)
+target_compile_definitions(heatshrink_dynalloc PUBLIC HEATSHRINK_DYNAMIC_ALLOC=1)
+target_include_directories(heatshrink_dynalloc
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+# Mirror layout LibBGCode expects: <heatshrink/heatshrink_*.h>
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/heatshrink")
+foreach(_hdr heatshrink_common heatshrink_config heatshrink_decoder heatshrink_encoder)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/${_hdr}.h
+                   ${CMAKE_CURRENT_BINARY_DIR}/include/heatshrink/${_hdr}.h
+                   COPYONLY)
+endforeach()
+target_include_directories(heatshrink_dynalloc PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+add_library(heatshrink::heatshrink_dynalloc ALIAS heatshrink_dynalloc)
+
+set(heatshrink_FOUND TRUE PARENT_SCOPE)

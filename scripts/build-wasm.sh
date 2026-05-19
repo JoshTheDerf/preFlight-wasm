@@ -43,6 +43,17 @@ if [[ ! -d "${PREFLIGHT}" ]]; then
     exit 1
 fi
 
+# 1.5) Drop the hand-written CMakeLists.txt files into the vendored
+# upstreams that don't ship a usable one. See vendor-cmake/README.md.
+if [[ -d "${ROOT}/deps/expat-2.6.3" && -f "${ROOT}/vendor-cmake/expat-2.6.3-CMakeLists.txt" ]]; then
+    cp "${ROOT}/vendor-cmake/expat-2.6.3-CMakeLists.txt" \
+       "${ROOT}/deps/expat-2.6.3/CMakeLists.txt"
+fi
+if [[ -d "${ROOT}/deps/heatshrink-src" && -f "${ROOT}/vendor-cmake/heatshrink-CMakeLists.txt" ]]; then
+    cp "${ROOT}/vendor-cmake/heatshrink-CMakeLists.txt" \
+       "${ROOT}/deps/heatshrink-src/CMakeLists.txt"
+fi
+
 # 2) Apply the WASM patch to preflight (idempotent)
 if [[ -f "${PATCH_FILE}" ]]; then
     pushd "${PREFLIGHT}" >/dev/null

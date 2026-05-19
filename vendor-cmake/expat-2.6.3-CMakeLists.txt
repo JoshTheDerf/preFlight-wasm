@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(expat C)
 
 # Minimal in-tree EXPAT build for the WASM target.
-set(EXPAT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/lib)
+set(EXPAT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 
 # Generate expat_config.h with the defines libexpat expects.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/expat_config.h

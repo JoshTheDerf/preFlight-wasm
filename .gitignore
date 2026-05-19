@@ -1,7 +1,19 @@
 # --- bootstrapped toolchain & vendor source (scripts/setup.sh fetches all this) ---
 # emsdk install (~1.6 GB), Boost source + install (~1.3 GB), portable cmake binary,
 # ccache binary + cache, vendored single-header libs that setup.sh downloads.
-deps/
+#
+# We ignore everything under deps/ but keep the build driver scripts in-tree,
+# since they're repo-owned source even though the directories themselves are
+# used as build & install prefixes. Each level must be un-ignored explicitly
+# (git won't recurse into an ignored dir, so `deps/*` rather than `deps/`).
+deps/*
+!deps/boost-wasm
+deps/boost-wasm/*
+!deps/boost-wasm/build_boost.sh
+!deps/toolchain-wasm
+deps/toolchain-wasm/*
+!deps/toolchain-wasm/build_math.sh
+!deps/toolchain-wasm/README.md
 
 # --- build output ---
 # cmake build tree + linked artifacts (slicer.js / slicer.wasm / slicer.data,

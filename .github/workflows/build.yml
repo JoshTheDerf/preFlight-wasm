@@ -233,23 +233,7 @@ jobs:
           NPROC: '4'
           CCACHE_DIR: ${{ github.workspace }}/preflight-wasm/deps/ccache-cache
         run: |
-          set -eo pipefail
-          # Pre-flight diagnostics — the script aborts fast on certain envs so
-          # capture state up front before invoking it.
-          echo '--- pre-build env ---'
-          echo "pwd=$PWD"
-          echo "PATH=$PATH"
-          which emcc cmake ninja || true
-          emcc -v 2>&1 | head -3 || true
-          echo '--- layout ---'
-          ls -la
-          ls -la ../preflight | head -5 || true
-          ls -la deps/emsdk | head -5 || true
-          ls -la deps/boost-wasm/install/lib | head -5 || true
-          ls -la deps/toolchain-wasm/install/lib | head -5 || true
-          ls -la patches/ wasm/toolchain/ scripts/ || true
-          echo '--- begin build ---'
-          bash -x scripts/build-wasm.sh 2>&1 | tail -200
+          bash scripts/build-wasm.sh
           echo '--- artifacts ---'
           ls -la build-wasm/slicer.{js,wasm,data}
           du -h build-wasm/slicer.{js,wasm,data}

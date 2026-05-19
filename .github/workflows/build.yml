@@ -269,6 +269,7 @@ jobs:
             preflight-wasm/build-wasm/slicer.js
             preflight-wasm/build-wasm/slicer.wasm
             preflight-wasm/build-wasm/slicer.data
+            preflight/resources/profiles/orca_system_profiles.json
           retention-days: 30
 
       # ------------------------------------------------------------------
@@ -282,12 +283,18 @@ jobs:
             preflight-wasm/build-wasm/slicer.js
             preflight-wasm/build-wasm/slicer.wasm
             preflight-wasm/build-wasm/slicer.data
+            preflight/resources/profiles/orca_system_profiles.json
           fail_on_unmatched_files: true
           body: |
             preFlight WASM build for `${{ github.ref_name }}`.
 
             Built against preFlight `${{ env.PREFLIGHT_REF }}` with emsdk `${{ env.EMSDK_VERSION }}`.
 
-            Drop these three files into your web app's `public/wasm/preflight/`
+            Drop `slicer.{js,wasm,data}` into your web app's `public/wasm/preflight/`
             and load `slicer.js` to instantiate `PreflightModule`.
+
+            `orca_system_profiles.json` is shipped separately (~32 KB) so hosts
+            can stage it under `public/wasm/preflight/profiles/` and fetch it
+            lazily — the slim `.data` blob no longer carries the profile library.
+
             See README and PORTING.md for the JS-side API and known limitations.

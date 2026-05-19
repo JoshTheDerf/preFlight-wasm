@@ -376,7 +376,15 @@ target_link_options(slicer PRIVATE
   -sEMULATE_FUNCTION_POINTER_CASTS=1
   -fexceptions
   -sASSERTIONS=1
-  --preload-file=../../preflight/resources@/resources
+  # Resource preload: headless slicing only touches a tiny slice of
+  # preflight/resources/. The rest of the tree (fonts ~20 MB, localization
+  # ~45 MB, icons, shaders, shapes, udev, embedded-Python preprocessor) is
+  # UI- or Python-only and would bloat the .data blob to ~70 MB.
+  #
+  # Profiles (`profiles/orca_system_profiles.json`) are served separately
+  # — the host loads them and writes into MEMFS at /resources/profiles/
+  # before slicing, so we don't pack them either.
+  --preload-file=../../preflight/resources/data@/resources/data
   "-sEXPORTED_FUNCTIONS=['_orc_init','_orc_slice','_malloc','_free','_orc_free','_orc_decode_exception']"
   "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','getValue','setValue','UTF8ToString','stringToUTF8','lengthBytesUTF8','HEAP8','HEAPU8','HEAP32','HEAPU32']"
 )

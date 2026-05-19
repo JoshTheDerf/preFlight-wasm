@@ -210,11 +210,10 @@ jobs:
           mkdir -p deps/ccache
           # The repo's build-wasm.sh adds deps/ccache/ to PATH if it exists;
           # populate it with a thin shim to /usr/bin/ccache so identical
-          # invocations are caught.
-          cat > deps/ccache/ccache <<'SHIM'
-          #!/usr/bin/env bash
-          exec /usr/bin/ccache "$@"
-          SHIM
+          # invocations are caught. (Inline write — avoids YAML/heredoc
+          # indentation pitfalls.)
+          printf '%s\n' '#!/usr/bin/env bash' 'exec /usr/bin/ccache "$@"' \
+            > deps/ccache/ccache
           chmod +x deps/ccache/ccache
           export CCACHE_DIR="$PWD/deps/ccache-cache"
           ccache --max-size=2G
@@ -229,7 +228,23 @@ jobs:
           NPROC: '4'
           CCACHE_DIR: ${{ github.workspace }}/preflight-wasm/deps/ccache-cache
         run: |
-          bash scripts/build-wasm.sh
+          set -eo pipefail
+          # Pre-flight diagnostics — the script aborts fast on certain envs so
+          # capture state up front before invoking it.
+          echo '--- pre-build env ---'
+          echo "pwd=$PWD"
+          echo "PATH=$PATH"
+          which emcc cmake ninja || true
+          emcc -v 2>&1 | head -3 || true
+          echo '--- layout ---'
+          ls -la
+          ls -la ../preflight | head -5 || true
+          ls -la deps/emsdk | head -5 || true
+          ls -la deps/boost-wasm/install/lib | head -5 || true
+          ls -la deps/toolchain-wasm/install/lib | head -5 || true
+          ls -la patches/ wasm/toolchain/ scripts/ || true
+          echo '--- begin build ---'
+          bash -x scripts/build-wasm.sh 2>&1 | tail -200
           echo '--- artifacts ---'
           ls -la build-wasm/slicer.{js,wasm,data}
           du -h build-wasm/slicer.{js,wasm,data}

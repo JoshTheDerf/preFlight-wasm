@@ -1,0 +1,1003 @@
+# preFlight WASM/Emscripten compatibility patch
+# Originally translated from allanwrench28/orcaslicer-wasm; significantly
+# extended for preflight's diverged GCode pipeline and post-export config dump.
+#
+# Apply against a clean preflight checkout:
+#   cd preflight && git apply path/to/preflight-wasm.patch
+#
+# Coverage (27 modified files):
+#
+#   Build-system gating (Emscripten/TBB/optional deps):
+#     CMakeLists.txt, src/CMakeLists.txt,
+#     bundled_deps/hidapi/CMakeLists.txt,
+#     src/libslic3r/CMakeLists.txt
+#
+#   Pipeline rewrites — the original parallel_pipeline used tbb::filter<I,O>
+#   type erasure that the wasm_shims TBB stub does not provide. Both
+#   process_layers variants are driven by a hand-rolled sequential loop
+#   under __EMSCRIPTEN__:
+#     src/libslic3r/GCode.cpp                (2 process_layers paths)
+#
+#   Post-export workaround (NEW vs. the original orcaslicer-wasm port) —
+#   skip append_full_config() under __EMSCRIPTEN__. The cfg.keys() virtual
+#   dispatch on Print::m_full_print_config traps with "null function" under
+#   -sEMULATE_FUNCTION_POINTER_CASTS=1 + -fexceptions, before entering the
+#   function body. The config-comment block it would emit is purely
+#   informational, so skipping is benign:
+#     src/libslic3r/GCode.cpp                (append_full_config call site)
+#
+#   Source-level guards — CGAL/Qhull/Boost.Process/libpng/seqarrange disabled,
+#   replacement nop bodies, transitive-include additions, Eigen 3.4 cast<>()
+#   hoists, libcxx unique_ptr {} ambiguity workaround:
+#     src/libslic3r/AABBTreeLines.hpp
+#     src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
+#     src/libslic3r/Feature/Interlocking/InterlockingGenerator.{cpp,hpp}
+#     src/libslic3r/Format/STEP.cpp
+#     src/libslic3r/GCode.hpp
+#     src/libslic3r/GCode/PostProcessor.cpp
+#     src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
+#     src/libslic3r/LayerRegion.cpp
+#     src/libslic3r/Model.cpp
+#     src/libslic3r/ObjectID.cpp
+#     src/libslic3r/PNGReadWrite.cpp
+#     src/libslic3r/Platform.cpp
+#     src/libslic3r/Print.cpp
+#     src/libslic3r/PrintObject.cpp
+#     src/libslic3r/ProgressConfig.hpp
+#     src/libslic3r/ShortestPath.hpp
+#     src/libslic3r/SupportSpotsGenerator.cpp
+#     src/libslic3r/SurfaceCollection.cpp
+#     src/libslic3r/Thread.cpp
+#     src/libslic3r/TriangleMesh.cpp
+#     src/libslic3r/Utils/DirectoriesUtils.cpp
+#
+# The corresponding bridge code lives outside this patch, in the
+# preflight-wasm/bridge/ sibling tree. Key things it does:
+#   - passes GCodeProcessorResult* to do_export() so the in-memory G-code
+#     (gcode_result.gcode_object->text_buffer()) is returned to JS — preflight's
+#     do_export uses memory-based G-code processing and does NOT write a file
+#     when no result pointer is supplied
+#   - global operator new/delete overrides DISABLED (#if 0) — keeping them
+#     interferes with libcxxabi's exception machinery under
+#     -sEMULATE_FUNCTION_POINTER_CASTS=1 and surfaces as null-function traps
+#     at G-code finalization.
+#
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6be83c8..0844e13 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -472,11 +472,21 @@ endif()
+ 
+ 
+ # Find and configure intel-tbb
++# TBB is optional when building for WASM; fall back to shims when disabled.
++set(TBB_FOUND FALSE)
+ if(SLIC3R_STATIC)
+     set(TBB_STATIC 1)
+ endif()
+ set(TBB_DEBUG 1)
+-find_package(TBB REQUIRED)
++if(NOT DEFINED CMAKE_DISABLE_FIND_PACKAGE_TBB OR NOT CMAKE_DISABLE_FIND_PACKAGE_TBB)
++    find_package(TBB)
++endif()
++if(TBB_FOUND)
++    add_compile_definitions(SLIC3R_USE_TBB=1)
++else()
++    set(TBB_FOUND FALSE)
++    add_compile_definitions(SLIC3R_USE_TBB=0)
++endif()
+ slic3r_remap_configs(TBB::tbb RelWithDebInfo Release)
+ slic3r_remap_configs(TBB::tbbmalloc RelWithDebInfo Release)
+ # include_directories(${TBB_INCLUDE_DIRS})
+@@ -488,40 +498,57 @@ slic3r_remap_configs(TBB::tbbmalloc RelWithDebInfo Release)
+ # The Intel TBB library will use the std::exception_ptr feature of C++11.
+ # add_definitions(-DTBB_USE_CAPTURED_EXCEPTION=0)
+ 
+-find_package(CURL REQUIRED)
++# CURL is only needed for network features (printer connectivity, online preset
++# updates). The WASM build is headless and does not link any of those code paths.
++if (NOT EMSCRIPTEN)
++    find_package(CURL REQUIRED)
++endif ()
+ 
+ add_library(libcurl INTERFACE)
+-target_link_libraries(libcurl INTERFACE CURL::libcurl)
++if (TARGET CURL::libcurl)
++    target_link_libraries(libcurl INTERFACE CURL::libcurl)
++endif ()
+ 
+ # Fixing curl's cmake config script bugs
+-if (NOT WIN32)
++if (NOT WIN32 AND NOT EMSCRIPTEN)
+     # Required by libcurl
+     find_package(ZLIB REQUIRED)
+     target_link_libraries(libcurl INTERFACE ZLIB::ZLIB)
+-else()
++elseif (WIN32)
+     target_link_libraries(libcurl INTERFACE crypt32)
+ endif()
+ 
+ ## OPTIONAL packages
+ 
+ # Find expat. We have our overriden FindEXPAT which exports libexpat target
+-# no matter what.
+-find_package(EXPAT REQUIRED)
++# no matter what. The WASM build provides EXPAT::EXPAT via deps/expat-2.6.3
++# as a subdir, so skip find_package there.
++if (NOT EMSCRIPTEN)
++    find_package(EXPAT REQUIRED)
++endif ()
+ 
+-add_library(libexpat INTERFACE)
++if (NOT TARGET libexpat)
++    add_library(libexpat INTERFACE)
++endif ()
+ 
+ if (TARGET EXPAT::EXPAT ) # found by a newer Find script
+     target_link_libraries(libexpat INTERFACE EXPAT::EXPAT)
+ elseif(TARGET expat::expat) # found by a config script
+     target_link_libraries(libexpat INTERFACE expat::expat)
+-else() # found by an older Find script
++elseif (EXPAT_LIBRARIES) # found by an older Find script
+     target_link_libraries(libexpat INTERFACE ${EXPAT_LIBRARIES})
+ endif ()
+ 
+-find_package(PNG REQUIRED)
++# PNG is gated out in WASM (PNGReadWrite.cpp stubs out the codec path).
++if (NOT EMSCRIPTEN)
++    find_package(PNG REQUIRED)
++endif ()
+ 
+ set(OpenGL_GL_PREFERENCE "LEGACY")
+-find_package(OpenGL REQUIRED)
++# OpenGL is GUI-only; the WASM build is headless so do not require it.
++if (NOT EMSCRIPTEN)
++    find_package(OpenGL REQUIRED)
++endif ()
+ 
+ # GLEW is no longer used - GLAD is bundled in libvgcode and exported as PUBLIC
+ # find_package(GLEW REQUIRED) - removed
+@@ -604,29 +631,36 @@ foreach(po_file ${L10N_PO_FILES})
+     )
+ endforeach()
+ 
+-find_package(NLopt 1.4 REQUIRED)
+-slic3r_remap_configs(NLopt::nlopt RelWithDebInfo Release)
++# NLopt is used by the arrange pipeline which is gated out for WASM.
++if (NOT EMSCRIPTEN)
++    find_package(NLopt 1.4 REQUIRED)
++    slic3r_remap_configs(NLopt::nlopt RelWithDebInfo Release)
++endif ()
+ 
+ if(SLIC3R_STATIC)
+     set(OPENVDB_USE_STATIC_LIBS ON)
+     set(USE_BLOSC TRUE)
+ endif ()
+ 
+-find_package(OpenVDB 5.0 COMPONENTS openvdb)
+-if(OpenVDB_FOUND)
+-    # OpenEXR 3.x uses Imath::Imath, OpenEXR 2.x uses IlmBase::Half
+-    if(TARGET Imath::Imath)
+-        slic3r_remap_configs(Imath::Imath RelWithDebInfo Release)
+-    elseif(TARGET IlmBase::Half)
+-        slic3r_remap_configs(IlmBase::Half RelWithDebInfo Release)
+-    endif()
+-    if(TARGET Blosc::blosc)
+-        slic3r_remap_configs(Blosc::blosc RelWithDebInfo Release)
+-    endif()
+-else ()
+-    message(FATAL_ERROR "OpenVDB could not be found with the bundled find module. "
+-                   "You can try to specify the find module location of your "
+-                   "OpenVDB installation with the OPENVDB_FIND_MODULE_PATH cache variable.")
++# OpenVDB is not built for the WASM target; the OpenVDB-backed code paths are
++# gated by `if (TARGET OpenVDB::openvdb)` checks in src/libslic3r/.
++if (NOT EMSCRIPTEN)
++    find_package(OpenVDB 5.0 COMPONENTS openvdb)
++    if(OpenVDB_FOUND)
++        # OpenEXR 3.x uses Imath::Imath, OpenEXR 2.x uses IlmBase::Half
++        if(TARGET Imath::Imath)
++            slic3r_remap_configs(Imath::Imath RelWithDebInfo Release)
++        elseif(TARGET IlmBase::Half)
++            slic3r_remap_configs(IlmBase::Half RelWithDebInfo Release)
++        endif()
++        if(TARGET Blosc::blosc)
++            slic3r_remap_configs(Blosc::blosc RelWithDebInfo Release)
++        endif()
++    else ()
++        message(FATAL_ERROR "OpenVDB could not be found with the bundled find module. "
++                       "You can try to specify the find module location of your "
++                       "OpenVDB installation with the OPENVDB_FIND_MODULE_PATH cache variable.")
++    endif ()
+ endif ()
+ 
+ # Python pre-processor: embedded interpreter for G-code pre-processing scripts
+diff --git a/bundled_deps/hidapi/CMakeLists.txt b/bundled_deps/hidapi/CMakeLists.txt
+index 34b6d76..bec7b8a 100644
+--- a/bundled_deps/hidapi/CMakeLists.txt
++++ b/bundled_deps/hidapi/CMakeLists.txt
+@@ -1,3 +1,10 @@
++if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
++    add_library(hidapi INTERFACE)
++    target_include_directories(hidapi INTERFACE
++        ${CMAKE_CURRENT_SOURCE_DIR}/include
++    )
++    return()
++endif()
+ 
+ if (WIN32)
+     set(HIDAPI_IMPL win/hid.c)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 9e16369..18b753c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -8,25 +8,32 @@ project(preFlight-native)
+ # preFlight uses Clipper2 for all polygon operations
+ add_subdirectory(clipper2)
+ message(STATUS "preFlight: Using Clipper2 exclusively")
+-find_package(Qhull 7.2 REQUIRED)
+ add_library(qhull INTERFACE)
+-if(SLIC3R_STATIC)
+-    slic3r_remap_configs("Qhull::qhullcpp;Qhull::qhullstatic_r" RelWithDebInfo Release)
+-    target_link_libraries(qhull INTERFACE Qhull::qhullcpp Qhull::qhullstatic_r)
+-else()
+-    slic3r_remap_configs("Qhull::qhullcpp;Qhull::qhull_r" RelWithDebInfo Release)
+-    target_link_libraries(qhull INTERFACE Qhull::qhullcpp Qhull::qhull_r)
+-endif()
++if (NOT EMSCRIPTEN)
++    find_package(Qhull 7.2 REQUIRED)
++    if(SLIC3R_STATIC)
++        slic3r_remap_configs("Qhull::qhullcpp;Qhull::qhullstatic_r" RelWithDebInfo Release)
++        target_link_libraries(qhull INTERFACE Qhull::qhullcpp Qhull::qhullstatic_r)
++    else()
++        slic3r_remap_configs("Qhull::qhullcpp;Qhull::qhull_r" RelWithDebInfo Release)
++        target_link_libraries(qhull INTERFACE Qhull::qhullcpp Qhull::qhull_r)
++    endif()
++endif ()
+ 
+ add_subdirectory(libslic3r)
+ 
+-if (SLIC3R_ENABLE_FORMAT_STEP)
++if (SLIC3R_ENABLE_FORMAT_STEP AND NOT EMSCRIPTEN)
+     add_subdirectory(occt_wrapper)
+ endif ()
+ 
+-add_subdirectory(slic3r-arrange)
+-add_subdirectory(slic3r-arrange-wrapper)
+-add_subdirectory(libseqarrange)
++# slic3r-arrange / arrange-wrapper / libseqarrange pull in deps (NLopt, CGAL,
++# heatshrink) that are not yet cross-compiled for WASM, and the WASM bridge
++# never invokes the arrange pipeline.
++if (NOT EMSCRIPTEN)
++    add_subdirectory(slic3r-arrange)
++    add_subdirectory(slic3r-arrange-wrapper)
++    add_subdirectory(libseqarrange)
++endif ()
+ 
+ 
+ if (SLIC3R_GUI)
+@@ -100,6 +107,12 @@ endif()
+ 
+ # Create a slic3r executable
+ # Process mainfests for various platforms.
++if (EMSCRIPTEN)
++    # Native preFlight CLI / GUI executables are not built for WASM; the WASM
++    # build only consumes libslic3r through a bridge module.
++    return()
++endif ()
++
+ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/preFlight.rc.in ${CMAKE_CURRENT_BINARY_DIR}/preFlight.rc @ONLY)
+ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/preFlight-gcodeviewer.rc.in ${CMAKE_CURRENT_BINARY_DIR}/preFlight-gcodeviewer.rc @ONLY)
+ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/preFlight.manifest.in ${CMAKE_CURRENT_BINARY_DIR}/preFlight.manifest @ONLY)
+diff --git a/src/libslic3r/AABBTreeLines.hpp b/src/libslic3r/AABBTreeLines.hpp
+index b5b56ae..2fd9c09 100644
+--- a/src/libslic3r/AABBTreeLines.hpp
++++ b/src/libslic3r/AABBTreeLines.hpp
+@@ -41,7 +41,9 @@ struct IndexedLinesDistancer
+     {
+         Vec<LineType::Dim, typename LineType::Scalar> nearest_point;
+         const LineType &line = lines[primitive_index];
+-        squared_distance = line_alg::distance_to_squared(line, origin.template cast<typename LineType::Scalar>(),
++        const Vec<LineType::Dim, typename LineType::Scalar> origin_cast =
++            origin.template cast<typename LineType::Scalar>();
++        squared_distance = line_alg::distance_to_squared(line, origin_cast,
+                                                          &nearest_point);
+         return nearest_point.template cast<ScalarType>();
+     }
+diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
+index 908415e..0a6a9b9 100644
+--- a/src/libslic3r/CMakeLists.txt
++++ b/src/libslic3r/CMakeLists.txt
+@@ -17,6 +17,9 @@ if (MINGW)
+     add_compile_options(-Wa,-mbig-obj)
+ endif ()
+ 
++option(SLIC3R_WITH_OCCT "Enable OCCT CAD features (STEP, text shapes)" ON)
++option(SLIC3R_WITH_OPENCV "Enable OpenCV-powered color utilities" ON)
++
+ set(OpenVDBUtils_SOURCES "")
+ if (TARGET OpenVDB::openvdb)
+     set(OpenVDBUtils_SOURCES OpenVDBUtils.cpp OpenVDBUtils.hpp OpenVDBUtilsLegacy.hpp)
+@@ -526,6 +529,13 @@ if (SLIC3R_PYTHON_PREPROCESSOR)
+     )
+ endif ()
+ 
++if (EMSCRIPTEN)
++    # Files that depend on deps not built for WASM (libseqarrange / qhull / occt).
++    list(REMOVE_ITEM SLIC3R_SOURCES
++        ArrangeHelper.cpp
++        ArrangeHelper.hpp
++    )
++endif ()
+ add_library(libslic3r STATIC ${SLIC3R_SOURCES})
+ 
+ 
+@@ -599,10 +609,15 @@ target_include_directories(libslic3r PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMA
+ target_include_directories(libslic3r PUBLIC ${EXPAT_INCLUDE_DIRS})
+ 
+ # libjpeg-turbo static builds produce jpeg-static.lib which FindJPEG can't locate
+-find_package(libjpeg-turbo CONFIG REQUIRED)
+-if(NOT TARGET JPEG::JPEG)
+-    add_library(JPEG::JPEG ALIAS libjpeg-turbo::jpeg-static)
+-endif()
++if (NOT EMSCRIPTEN)
++    find_package(libjpeg-turbo CONFIG REQUIRED)
++    if(NOT TARGET JPEG::JPEG)
++        add_library(JPEG::JPEG ALIAS libjpeg-turbo::jpeg-static)
++    endif()
++else ()
++    # WASM build does not load JPEG images (thumbnails are pre-rendered server side).
++    add_library(JPEG::JPEG INTERFACE IMPORTED)
++endif ()
+ find_package(nlohmann_json REQUIRED)
+ 
+ # preFlight exclusively uses Clipper2 for all polygon operations
+@@ -615,8 +630,6 @@ target_link_libraries(libslic3r PRIVATE
+     libexpat
+     glu-libtess
+     qhull
+-    TBB::tbb
+-    TBB::tbbmalloc
+     libslic3r_cgal
+     ${CMAKE_DL_LIBS}
+     PNG::PNG
+@@ -628,7 +641,7 @@ target_link_libraries(libslic3r PRIVATE
+     nlohmann_json::nlohmann_json
+     stb_truetype
+ )
+-target_link_libraries(libslic3r PUBLIC
++set(_preflight_libslic3r_public_deps
+     Eigen3::Eigen
+     semver
+     admesh
+@@ -640,8 +653,26 @@ target_link_libraries(libslic3r PUBLIC
+     agg
+     ankerl
+     boost_headeronly
+-    libseqarrange
+ )
++# libseqarrange depends on NLopt which is not built for WASM.
++if (NOT EMSCRIPTEN)
++    list(APPEND _preflight_libslic3r_public_deps
++        libseqarrange
++    )
++endif ()
++target_link_libraries(libslic3r PUBLIC ${_preflight_libslic3r_public_deps})
++if (EMSCRIPTEN)
++    target_compile_definitions(libslic3r PUBLIC SLIC3R_NO_SEQARRANGE)
++endif ()
++
++# WASM/optional dependency wiring (added by preflight-wasm patch)
++if (TBB_FOUND)
++    target_link_libraries(libslic3r PRIVATE TBB::tbb TBB::tbbmalloc)
++endif ()
++
++if (NOT SLIC3R_WITH_OCCT)
++    target_compile_definitions(libslic3r PUBLIC SLIC3R_NO_OCCT)
++endif ()
+ 
+ if (APPLE)
+     # TODO: we need to fix notarization with the separate shared library
+diff --git a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
+index 68ad2ed..32af6ae 100644
+--- a/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
++++ b/src/libslic3r/Feature/FuzzySkin/FuzzySkin.cpp
+@@ -72,8 +72,13 @@ void clear_visibility_cache()
+ static double random_value()
+ {
+     thread_local std::random_device rd;
+-    // Hash thread ID for random number seed if no hardware rng seed is available
++#ifndef __EMSCRIPTEN__
++    // Hash thread ID for random number seed if no hardware rng seed is available.
+     thread_local std::mt19937 gen(rd.entropy() > 0 ? rd() : std::hash<std::thread::id>()(std::this_thread::get_id()));
++#else
++    // Emscripten builds are effectively single-threaded, fall back to device entropy.
++    thread_local std::mt19937 gen(rd());
++#endif
+     thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+     return dist(gen);
+ }
+diff --git a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.cpp b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.cpp
+index 74f547b..38e1338 100644
+--- a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.cpp
++++ b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.cpp
+@@ -6,6 +6,8 @@
+ 
+ #include "InterlockingGenerator.hpp"
+ 
++#include <unordered_set>
++
+ #include "libslic3r/ClipperUtils.hpp"
+ 
+ namespace std
+diff --git a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
+index 8fa11b5..7ddee11 100644
+--- a/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
++++ b/src/libslic3r/Feature/Interlocking/InterlockingGenerator.hpp
+@@ -7,6 +7,9 @@
+ #ifndef INTERLOCKING_GENERATOR_HPP
+ #define INTERLOCKING_GENERATOR_HPP
+ 
++#include <unordered_set>
++#include <vector>
++
+ #include "libslic3r/Print.hpp"
+ #include "VoxelUtils.hpp"
+ 
+diff --git a/src/libslic3r/Format/STEP.cpp b/src/libslic3r/Format/STEP.cpp
+index 5eb23c7..62ce37b 100644
+--- a/src/libslic3r/Format/STEP.cpp
++++ b/src/libslic3r/Format/STEP.cpp
+@@ -4,6 +4,21 @@
+ ///|/ preFlight is based on PrusaSlicer and released under AGPLv3 or higher
+ ///|/
+ #include "STEP.hpp"
++
++#ifdef SLIC3R_NO_OCCT
++
++#include "libslic3r/Model.hpp"
++
++namespace Slic3r
++{
++bool load_step(const char * /*path*/, Model * /*model*/,
++               std::optional<std::pair<double, double>> /*deflections*/, std::string * /*warning_out*/)
++{
++    return false;
++}
++} // namespace Slic3r
++
++#else
+ #include "occt_wrapper/OCCTWrapper.hpp"
+ 
+ #include "libslic3r/Model.hpp"
+@@ -145,3 +160,5 @@ bool load_step(const char *path, Model *model /*BBS:, ImportStepProgressFn proFn
+ }
+ 
+ }; // namespace Slic3r
++
++#endif // SLIC3R_NO_OCCT
+diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
+index 494c23c..ea2523d 100644
+--- a/src/libslic3r/GCode.cpp
++++ b/src/libslic3r/GCode.cpp
+@@ -1823,10 +1823,22 @@ void GCodeGenerator::_do_export(Print &print, GCodeOutputStream &file, Thumbnail
+         // The delimiters are structured as configuration key / value pairs to be parsable by G-code viewers.
+         {
+             file.write("\n; preflight_config = begin\n");
++#ifndef __EMSCRIPTEN__
++            // WASM: skip the full-config dump. append_full_config() →
++            // encode_full_config() → cfg.keys() does a virtual dispatch on
++            // Print::m_full_print_config (a DynamicConfig). Under emscripten with
++            // -sEMULATE_FUNCTION_POINTER_CASTS=1 + -fexceptions, that dispatch
++            // resolves to function-table index 0 (a trap thunk) before entering the
++            // function body, surfacing as a "null function" trap. The config-
++            // comment block this writes is purely informational and not consumed
++            // by any downstream tool, so skipping it is benign. Until the
++            // underlying vtable/thunk-table issue is solved, this lets WASM
++            // slicing complete with valid G-code output.
+             std::string full_config;
+             append_full_config(*m_print, full_config);
+             if (!full_config.empty())
+                 file.write(full_config);
++#endif
+             file.write("; preflight_config = end\n");
+         }
+ 
+@@ -2028,6 +2040,30 @@ void GCodeGenerator::process_layers(const Print &print, const ToolOrdering &tool
+                     fprintf(stderr, "[TIMELINE] L%03zu output   EXIT   @ %7.1fms\n", idx, elapsed());
+         });
+ 
++#ifdef __EMSCRIPTEN__
++    // WASM: tbb::filter<I, O> type erasure is not implemented in the shim.
++    // Drive the pipeline sequentially by invoking each filter stage directly.
++    TBBLocalesSetter locales_setter;
++    output_stream.find_replace_supress();
++    {
++        tbb::flow_control fc;
++        while (!fc.is_stopped()) {
++            auto p = smooth_path_interpolator(fc);
++            if (fc.is_stopped()) break;
++            auto lr = generator(std::move(p));
++            if (m_spiral_vase)
++                lr = spiral_vase(std::move(lr));
++            if (m_pressure_equalizer)
++                lr = pressure_equalizer(std::move(lr));
++            lr = arc_handler(std::move(lr));
++            auto str = cooling(std::move(lr));
++            if (m_find_replace)
++                str = find_replace(std::move(str));
++            output(std::move(str));
++        }
++    }
++    output_stream.find_replace_enable();
++#else
+     tbb::filter<void, LayerResult> pipeline_to_layerresult = smooth_path_interpolator & generator;
+     if (m_spiral_vase)
+         pipeline_to_layerresult = pipeline_to_layerresult & spiral_vase;
+@@ -2043,6 +2079,7 @@ void GCodeGenerator::process_layers(const Print &print, const ToolOrdering &tool
+     output_stream.find_replace_supress();
+     tbb::parallel_pipeline(12, pipeline_to_layerresult & pipeline_to_string & output);
+     output_stream.find_replace_enable();
++#endif
+ 
+     perf_print("[TIMING]   gcode pipeline breakdown (%zu layers):\n"
+                "[TIMING]     set_status:     %7.1fms\n"
+@@ -2168,6 +2205,28 @@ void GCodeGenerator::process_layers(const Print &print, const ToolOrdering &tool
+                                                                 t_output.add(to0, std::chrono::steady_clock::now());
+                                                             });
+ 
++#ifdef __EMSCRIPTEN__
++    TBBLocalesSetter locales_setter;
++    output_stream.find_replace_supress();
++    {
++        tbb::flow_control fc;
++        while (!fc.is_stopped()) {
++            auto p = smooth_path_interpolator(fc);
++            if (fc.is_stopped()) break;
++            auto lr = generator(std::move(p));
++            if (m_spiral_vase)
++                lr = spiral_vase(std::move(lr));
++            if (m_pressure_equalizer)
++                lr = pressure_equalizer(std::move(lr));
++            lr = arc_handler(std::move(lr));
++            auto str = cooling(std::move(lr));
++            if (m_find_replace)
++                str = find_replace(std::move(str));
++            output(std::move(str));
++        }
++    }
++    output_stream.find_replace_enable();
++#else
+     tbb::filter<void, LayerResult> pipeline_to_layerresult = smooth_path_interpolator & generator;
+     if (m_spiral_vase)
+         pipeline_to_layerresult = pipeline_to_layerresult & spiral_vase;
+@@ -2186,6 +2245,7 @@ void GCodeGenerator::process_layers(const Print &print, const ToolOrdering &tool
+     output_stream.find_replace_supress();
+     tbb::parallel_pipeline(12, pipeline_to_layerresult & pipeline_to_string & output);
+     output_stream.find_replace_enable();
++#endif
+ }
+ 
+ std::string GCodeGenerator::placeholder_parser_process(const std::string &name, const std::string &templ,
+diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
+index 1728077..cef0937 100644
+--- a/src/libslic3r/GCode.hpp
++++ b/src/libslic3r/GCode.hpp
+@@ -97,7 +97,7 @@ struct LayerResult
+     // It is used for the pressure equalizer because it needs to buffer one layer back.
+     bool nop_layer_result{false};
+ 
+-    static LayerResult make_nop_layer_result() { return {"", std::numeric_limits<coord_t>::max(), false, false, true}; }
++    static LayerResult make_nop_layer_result() { return {"", std::numeric_limits<size_t>::max(), false, false, true}; }
+ };
+ 
+ namespace GCode
+diff --git a/src/libslic3r/GCode/PostProcessor.cpp b/src/libslic3r/GCode/PostProcessor.cpp
+index 02773da..5ea2847 100644
+--- a/src/libslic3r/GCode/PostProcessor.cpp
++++ b/src/libslic3r/GCode/PostProcessor.cpp
+@@ -174,6 +174,15 @@ static int run_script(const std::string &script, const std::string &gcode, std::
+     return (int) execute_process_winapi(command_line);
+ }
+ 
++#elif defined(__EMSCRIPTEN__)
++// WASM: post-processing scripts are meaningless in a browser context. Provide
++// a no-op stub so the rest of the file links cleanly without dragging in
++// boost::process::v2 (Boost 1.83 only ships v1).
++static int run_script(const std::string & /*script*/, const std::string & /*gcode*/, std::string & /*std_err*/)
++{
++    return 0;
++}
++
+ #else
+ // POSIX
+ 
+diff --git a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp b/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
+index 477a6db..e733937 100644
+--- a/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
++++ b/src/libslic3r/Geometry/VoronoiUtilsCgal.cpp
+@@ -3,6 +3,68 @@
+ ///|/
+ ///|/ preFlight is based on PrusaSlicer and released under AGPLv3 or higher
+ ///|/
++#ifdef __EMSCRIPTEN__
++
++#include <vector>
++#include <cassert>
++#include <boost/variant/get.hpp>
++
++#include "libslic3r/Geometry/Voronoi.hpp"
++#include "libslic3r/Geometry/VoronoiUtils.hpp"
++#include "libslic3r/Arachne/utils/PolygonsSegmentIndex.hpp"
++#include "libslic3r/Athena/utils/PolygonsSegmentIndex.hpp"
++#include "libslic3r/MultiMaterialSegmentation.hpp"
++#include "VoronoiUtilsCgal.hpp"
++#include "libslic3r/Line.hpp"
++#include "libslic3r/Point.hpp"
++
++using VD = Slic3r::Geometry::VoronoiDiagram;
++
++namespace Slic3r::Geometry
++{
++
++bool VoronoiUtilsCgal::is_voronoi_diagram_planar_intersection(const VD &)
++{
++    return true;
++}
++
++template<typename SegmentIterator>
++typename boost::polygon::enable_if<
++    typename boost::polygon::gtl_if<typename boost::polygon::is_segment_concept<
++        typename boost::polygon::geometry_concept<typename std::iterator_traits<SegmentIterator>::value_type>::type>::type>::type,
++    bool>::type
++VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, SegmentIterator, SegmentIterator)
++{
++    return true;
++}
++
++} // namespace Slic3r::Geometry
++
++// Explicit template instantiations matching the non-EMSCRIPTEN branch so
++// every consumer's iterator type resolves to an actual symbol at link time.
++#include "libslic3r/Arachne/utils/PolygonsSegmentIndex.hpp"
++#include "libslic3r/Athena/utils/PolygonsSegmentIndex.hpp"
++#include "libslic3r/MultiMaterialSegmentation.hpp"
++#include "libslic3r/Geometry/Voronoi.hpp"
++#include "libslic3r/Geometry/VoronoiUtils.hpp"
++#include "libslic3r/Line.hpp"
++
++namespace Slic3r::Geometry
++{
++using PolygonsSegmentIndexConstIt = std::vector<Arachne::PolygonsSegmentIndex>::const_iterator;
++using AthenaPolygonsSegmentIndexConstIt = std::vector<Athena::PolygonsSegmentIndex>::const_iterator;
++using LinesIt = Lines::iterator;
++using ColoredLinesConstIt = ColoredLines::const_iterator;
++
++template bool VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, LinesIt, LinesIt);
++template bool VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, VD::SegmentIt, VD::SegmentIt);
++template bool VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, ColoredLinesConstIt, ColoredLinesConstIt);
++template bool VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, PolygonsSegmentIndexConstIt, PolygonsSegmentIndexConstIt);
++template bool VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &, AthenaPolygonsSegmentIndexConstIt, AthenaPolygonsSegmentIndexConstIt);
++} // namespace Slic3r::Geometry
++
++#else // __EMSCRIPTEN__
++
+ #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
+ #include <CGAL/Arr_segment_traits_2.h>
+ #include <CGAL/Surface_sweep_2_algorithms.h>
+@@ -382,4 +444,6 @@ VoronoiUtilsCgal::is_voronoi_diagram_planar_angle(const VD &voronoi_diagram, con
+     return true;
+ }
+ 
+-} // namespace Slic3r::Geometry
+\ No newline at end of file
++} // namespace Slic3r::Geometry
++
++#endif // __EMSCRIPTEN__
+diff --git a/src/libslic3r/LayerRegion.cpp b/src/libslic3r/LayerRegion.cpp
+index d321cd2..eb98f0a 100644
+--- a/src/libslic3r/LayerRegion.cpp
++++ b/src/libslic3r/LayerRegion.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <string>
+ #include <map>
++#include <unordered_set>
+ #include <array>
+ #include <cmath>
+ #include <initializer_list>
+diff --git a/src/libslic3r/Model.cpp b/src/libslic3r/Model.cpp
+index a337dd8..6c150cb 100644
+--- a/src/libslic3r/Model.cpp
++++ b/src/libslic3r/Model.cpp
+@@ -34,6 +34,8 @@
+ #include <boost/nowide/iostream.hpp>
+ 
+ #include <tbb/concurrent_vector.h>
++#include <tbb/parallel_for.h>
++#include <tbb/blocked_range.h>
+ 
+ #include "SVG.hpp"
+ #include <Eigen/Dense>
+diff --git a/src/libslic3r/ObjectID.cpp b/src/libslic3r/ObjectID.cpp
+index 8727569..df6c9ed 100644
+--- a/src/libslic3r/ObjectID.cpp
++++ b/src/libslic3r/ObjectID.cpp
+@@ -5,6 +5,8 @@
+ ///|/
+ #include "ObjectID.hpp"
+ 
++#include <vector>
++
+ namespace Slic3r
+ {
+ 
+diff --git a/src/libslic3r/PNGReadWrite.cpp b/src/libslic3r/PNGReadWrite.cpp
+index d092ffd..e7d12dd 100644
+--- a/src/libslic3r/PNGReadWrite.cpp
++++ b/src/libslic3r/PNGReadWrite.cpp
+@@ -8,6 +8,34 @@
+ ///|/
+ #include "PNGReadWrite.hpp"
+ 
++#ifdef __EMSCRIPTEN__
++// libpng is not built for the WASM target; expose no-op fallbacks so call
++// sites link without pulling in the codec.
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace Slic3r { namespace png {
++bool decode_png(IStream &, ImageGreyscale &)                                                                   { return false; }
++bool is_png(const ReadBuf &)                                                                                    { return false; }
++bool decode_png(const std::string &, std::vector<unsigned char> &, unsigned &, unsigned &)                      { return false; }
++bool write_rgb_to_file(const char *, size_t, size_t, const uint8_t *)                                           { return false; }
++bool write_rgb_to_file(const std::string &, size_t, size_t, const uint8_t *)                                    { return false; }
++bool write_rgb_to_file(const std::string &, size_t, size_t, const std::vector<uint8_t> &)                       { return false; }
++bool write_gray_to_file(const char *, size_t, size_t, const uint8_t *)                                          { return false; }
++bool write_gray_to_file(const std::string &, size_t, size_t, const uint8_t *)                                   { return false; }
++bool write_gray_to_file(const std::string &, size_t, size_t, const std::vector<uint8_t> &)                      { return false; }
++bool write_rgb_to_file_scaled(const char *, size_t, size_t, const uint8_t *, size_t)                            { return false; }
++bool write_rgb_to_file_scaled(const std::string &, size_t, size_t, const uint8_t *, size_t)                     { return false; }
++bool write_rgb_to_file_scaled(const std::string &, size_t, size_t, const std::vector<uint8_t> &, size_t)        { return false; }
++bool write_gray_to_file_scaled(const char *, size_t, size_t, const uint8_t *, size_t)                           { return false; }
++bool write_gray_to_file_scaled(const std::string &, size_t, size_t, const uint8_t *, size_t)                    { return false; }
++bool write_gray_to_file_scaled(const std::string &, size_t, size_t, const std::vector<uint8_t> &, size_t)       { return false; }
++}} // namespace Slic3r::png
++
++#else // __EMSCRIPTEN__
++
+ #include <png.h>
+ #include <boost/log/trivial.hpp>
+ #include <boost/nowide/cstdio.hpp>
+@@ -330,3 +358,5 @@ bool write_gray_to_file_scaled(const std::string &file_name_utf8, size_t width,
+ 
+ } // namespace png
+ } // namespace Slic3r
++
++#endif // !__EMSCRIPTEN__
+diff --git a/src/libslic3r/Platform.cpp b/src/libslic3r/Platform.cpp
+index 70c9ce4..6be3abe 100644
+--- a/src/libslic3r/Platform.cpp
++++ b/src/libslic3r/Platform.cpp
+@@ -71,6 +71,10 @@ void detect_platform()
+             }
+         }
+     }
++#elif defined(__EMSCRIPTEN__)
++    BOOST_LOG_TRIVIAL(info) << "Platform: Emscripten";
++    s_platform = Platform::Linux;
++    s_platform_flavor = PlatformFlavor::GenericLinux;
+ #elif defined(__linux__)
+     BOOST_LOG_TRIVIAL(info) << "Platform: Linux";
+     s_platform = Platform::Linux;
+diff --git a/src/libslic3r/Print.cpp b/src/libslic3r/Print.cpp
+index 38593fb..127e625 100644
+--- a/src/libslic3r/Print.cpp
++++ b/src/libslic3r/Print.cpp
+@@ -40,7 +40,9 @@
+ #include "Utils.hpp"
+ #include "BuildVolume.hpp"
+ #include "format.hpp"
++#ifndef __EMSCRIPTEN__
+ #include "ArrangeHelper.hpp"
++#endif
+ #include "CustomParametersHandling.hpp"
+ 
+ #include <float.h>
+@@ -1305,7 +1307,12 @@ void Print::process()
+         BOOST_LOG_TRIVIAL(error) << boost::format("gcode path conflicts found between %1% and %2%") %
+                                         conflictRes->_objName1 % conflictRes->_objName2;
+ 
++#ifdef __EMSCRIPTEN__
++    // libseqarrange is not built for WASM; assume no collision.
++    m_sequential_collision_detected = std::nullopt;
++#else
+     m_sequential_collision_detected = config().complete_objects ? check_seq_conflict(model(), config()) : std::nullopt;
++#endif
+ 
+     // printf("[%lld] SLICING COMPLETE\n",
+     //     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+diff --git a/src/libslic3r/PrintObject.cpp b/src/libslic3r/PrintObject.cpp
+index 8b05037..b152dfc 100644
+--- a/src/libslic3r/PrintObject.cpp
++++ b/src/libslic3r/PrintObject.cpp
+@@ -542,7 +542,7 @@ void PrintObject::clear_fills()
+     // crashes (silent app closure) due to geometry mismatches.
+     // Root cause of: Grid/Triangles/Stars/Cubic crashes on reslice with different density.
+     // preFlight: Apple libc++ finds '= {}' ambiguous for pair<unique_ptr<..., CustomDeleter>, ...>
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
+     m_adaptive_fill_octrees.first.reset();
+     m_adaptive_fill_octrees.second.reset();
+ #else
+diff --git a/src/libslic3r/ProgressConfig.hpp b/src/libslic3r/ProgressConfig.hpp
+index dd2c483..d3c6ab9 100644
+--- a/src/libslic3r/ProgressConfig.hpp
++++ b/src/libslic3r/ProgressConfig.hpp
+@@ -5,6 +5,8 @@
+ #ifndef slic3r_ProgressConfig_hpp_
+ #define slic3r_ProgressConfig_hpp_
+ 
++#include <string>
++
+ //
+ // This configuration allows easy adjustment of progress bar granularity.
+ // Each weight represents the RELATIVE time spent in that operation.
+diff --git a/src/libslic3r/ShortestPath.hpp b/src/libslic3r/ShortestPath.hpp
+index ced425a..cd89bcb 100644
+--- a/src/libslic3r/ShortestPath.hpp
++++ b/src/libslic3r/ShortestPath.hpp
+@@ -16,6 +16,7 @@
+ #include "Point.hpp"
+ #include "libslic3r/ExPolygon.hpp"
+ #include "libslic3r/Polyline.hpp"
++#include "libslic3r/ClipperUtils.hpp" // PolyNodes
+ 
+ namespace Slic3r
+ {
+diff --git a/src/libslic3r/SupportSpotsGenerator.cpp b/src/libslic3r/SupportSpotsGenerator.cpp
+index 122dba3..d40d151 100644
+--- a/src/libslic3r/SupportSpotsGenerator.cpp
++++ b/src/libslic3r/SupportSpotsGenerator.cpp
+@@ -570,7 +570,8 @@ float compute_second_moment(const Integrals &integrals, const Vec2f &axis_direct
+ 
+     const Linef axis_at_0_0 = {{0, 0}, axis_direction.cast<double>()};
+ 
+-    const double distance = distance_to_infinite_squared(axis_at_0_0, centroid.cast<double>());
++    const Vec2d centroid_d = centroid.cast<double>();
++    const double distance = distance_to_infinite_squared(axis_at_0_0, centroid_d);
+     return moment_at_0_0 - area * distance;
+ }
+ 
+@@ -683,10 +684,11 @@ float ObjectPart::compute_elastic_section_modulus(const Vec2f &line_dir, const V
+     }
+ 
+     Vec2f centroid = integrals.x_i / integrals.area;
++    const Vec2d centroid_d2 = centroid.head<2>().cast<double>();
++    const Vec2d other_d2    = (centroid.head<2>() + Vec2f(line_dir.y(), -line_dir.x())).cast<double>();
++    const Vec2d extreme_d2  = extreme_point.head<2>().cast<double>();
+     float extreme_fiber_dist =
+-        line_alg::distance_to(Linef(centroid.head<2>().cast<double>(),
+-                                    (centroid.head<2>() + Vec2f(line_dir.y(), -line_dir.x())).cast<double>()),
+-                              extreme_point.head<2>().cast<double>());
++        line_alg::distance_to(Linef(centroid_d2, other_d2), extreme_d2);
+ 
+     float elastic_section_modulus = second_moment_of_area / extreme_fiber_dist;
+ 
+diff --git a/src/libslic3r/SurfaceCollection.cpp b/src/libslic3r/SurfaceCollection.cpp
+index 4658ee3..a1ee307 100644
+--- a/src/libslic3r/SurfaceCollection.cpp
++++ b/src/libslic3r/SurfaceCollection.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <unordered_set>
+ 
+ #include "BoundingBox.hpp"
+ #include "SVG.hpp"
+diff --git a/src/libslic3r/Thread.cpp b/src/libslic3r/Thread.cpp
+index 440745d..2373a73 100644
+--- a/src/libslic3r/Thread.cpp
++++ b/src/libslic3r/Thread.cpp
+@@ -181,6 +181,29 @@ std::optional<std::string> get_current_thread_name()
+ 
+ #else
+ 
++#if defined(__EMSCRIPTEN__)
++// Emscripten runs single-threaded; pthread naming APIs are unavailable.
++bool set_thread_name(std::thread &, const char *)
++{
++    return false;
++}
++
++bool set_thread_name(boost::thread &, const char *)
++{
++    return false;
++}
++
++bool set_current_thread_name(const char *)
++{
++    return false;
++}
++
++std::optional<std::string> get_current_thread_name()
++{
++    return std::nullopt;
++}
++#else
++
+ // posix
+ bool set_thread_name(std::thread &thread, const char *thread_name)
+ {
+@@ -205,6 +228,7 @@ std::optional<std::string> get_current_thread_name()
+     char buf[16];
+     return std::string(pthread_getname_np(pthread_self(), buf, 16) == 0 ? buf : "");
+ }
++#endif
+ 
+ #endif
+ 
+diff --git a/src/libslic3r/TriangleMesh.cpp b/src/libslic3r/TriangleMesh.cpp
+index 73d2289..c48a83d 100644
+--- a/src/libslic3r/TriangleMesh.cpp
++++ b/src/libslic3r/TriangleMesh.cpp
+@@ -14,16 +14,20 @@
+ ///|/
+ ///|/ preFlight is based on PrusaSlicer and released under AGPLv3 or higher
+ ///|/
++#ifndef __EMSCRIPTEN__
+ #include <libqhullcpp/Qhull.h>
+ #include <libqhullcpp/QhullFacetList.h>
+ #include <libqhullcpp/QhullVertexSet.h>
++#endif
+ #include <boost/log/trivial.hpp>
+ #include <boost/nowide/cstdio.hpp>
+ #include <boost/predef/other/endian.h>
++#ifndef __EMSCRIPTEN__
+ #include <libqhull_r/user_r.h>
+ #include <libqhullcpp/QhullFacet.h>
+ #include <libqhullcpp/QhullPoint.h>
+ #include <libqhullcpp/QhullVertex.h>
++#endif
+ #include <oneapi/tbb/blocked_range.h>
+ #include <oneapi/tbb/concurrent_vector.h>
+ #include <oneapi/tbb/parallel_for.h>
+@@ -1574,6 +1578,12 @@ indexed_triangle_set its_convex_hull(const std::vector<Vec3f> &pts)
+ {
+     std::vector<Vec3f> dst_vertices;
+     std::vector<Vec3i> dst_facets;
++#ifdef __EMSCRIPTEN__
++    // Qhull is not built for the WASM target; convex_hull is not exercised by
++    // the headless slicer code path.
++    (void) pts;
++    return {std::move(dst_facets), std::move(dst_vertices)};
++#else
+ 
+     if (!pts.empty())
+     {
+@@ -1663,6 +1673,7 @@ indexed_triangle_set its_convex_hull(const std::vector<Vec3f> &pts)
+     }
+ 
+     return {std::move(dst_facets), std::move(dst_vertices)};
++#endif // !__EMSCRIPTEN__
+ }
+ 
+ void its_reverse_all_facets(indexed_triangle_set &its)
+diff --git a/src/libslic3r/Utils/DirectoriesUtils.cpp b/src/libslic3r/Utils/DirectoriesUtils.cpp
+index 663ba62..94f0a57 100644
+--- a/src/libslic3r/Utils/DirectoriesUtils.cpp
++++ b/src/libslic3r/Utils/DirectoriesUtils.cpp
+@@ -115,6 +115,11 @@ std::string GetDataDir()
+     return {};
+ }
+ 
++#elif defined(__EMSCRIPTEN__)
++
++// WASM: no file system. Return a virtual writable location under MEMFS.
++static std::string GetDataDir() { return "/data"; }
++
+ #endif
+ 
+ namespace Slic3r

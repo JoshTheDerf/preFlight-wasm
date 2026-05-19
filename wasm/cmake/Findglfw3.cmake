@@ -1,0 +1,13 @@
+# Minimal glfw3 shim for Emscripten/WASM
+set(glfw3_FOUND TRUE)
+set(GLFW3_FOUND TRUE)
+set(glfw3_INCLUDE_DIR "")
+set(glfw3_LIBRARY "")
+set(GLFW3_INCLUDE_DIR "")
+set(GLFW3_LIBRARY "")
+if(NOT TARGET glfw)
+  add_library(glfw INTERFACE IMPORTED)
+endif()
+if(NOT TARGET glfw3::glfw)
+  add_library(glfw3::glfw INTERFACE IMPORTED)
+endif()

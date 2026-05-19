@@ -1,0 +1,8 @@
+# Minimal Cereal shim for Emscripten/WASM (header-only lib)
+set(cereal_FOUND TRUE)
+set(CEREAL_FOUND TRUE)
+set(cereal_INCLUDE_DIR "")
+set(CEREAL_INCLUDE_DIR "")
+if(NOT TARGET cereal::cereal)
+  add_library(cereal::cereal INTERFACE IMPORTED)
+endif()

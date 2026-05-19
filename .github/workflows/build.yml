@@ -13,6 +13,11 @@ on:
         required: false
         default: 'v1.0.0'
 
+# Tag pushes (v*) need write access to publish releases. PRs and main-branch
+# pushes only need read access.
+permissions:
+  contents: write
+
 env:
   # Pin the emsdk version. Tested with 5.0.7 locally; bump deliberately.
   EMSDK_VERSION: '5.0.7'

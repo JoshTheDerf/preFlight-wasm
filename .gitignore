@@ -34,6 +34,6 @@ preflight/
 *.rej
 *.bak
 
-# --- node-side smoke test artifacts ---
+# --- node-side scratch copies (the real test lives at tests/slice-test.cjs) ---
 slicer.cjs
-slice-test.cjs
+/slice-test.cjs

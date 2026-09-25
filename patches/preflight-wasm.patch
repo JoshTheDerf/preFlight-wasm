@@ -97,6 +97,20 @@ index 9e16369..8ee4ee1 100644
  # Create a slic3r executable
  # Process mainfests for various platforms.
  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/platform/msw/preFlight.rc.in ${CMAKE_CURRENT_BINARY_DIR}/preFlight.rc @ONLY)
+diff --git a/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp b/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
+index b2bf86c..5fccf7b 100644
+--- a/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
++++ b/src/libslic3r/Arachne/SkeletalTrapezoidation.cpp
+@@ -1914,7 +1914,8 @@ SkeletalTrapezoidation::Beading SkeletalTrapezoidation::interpolate(const Beadin
+     // TODO: don't use toolpath locations past the middle!
+     // TODO: stretch bead widths and locations of the higher bead count beading to fit in the left over space
+     coord_t next_inset_idx;
+-    for (next_inset_idx = left.toolpath_locations.size() - 1; next_inset_idx >= 0; next_inset_idx--)
++    // preflight-wasm: cast before subtracting; with 32-bit size_t an empty vector gave 4294967295 (positive in int64 -> OOB)
++    for (next_inset_idx = coord_t(left.toolpath_locations.size()) - 1; next_inset_idx >= 0; next_inset_idx--)
+     {
+         if (switching_radius > left.toolpath_locations[next_inset_idx])
+         {
 diff --git a/src/libslic3r/Athena/BeadingStrategy/SplitPromotionBeadingStrategy.cpp b/src/libslic3r/Athena/BeadingStrategy/SplitPromotionBeadingStrategy.cpp
 index 046e5f5..3431f25 100644
 --- a/src/libslic3r/Athena/BeadingStrategy/SplitPromotionBeadingStrategy.cpp
@@ -109,6 +123,20 @@ index 046e5f5..3431f25 100644
  
  namespace Slic3r::Athena
  {
+diff --git a/src/libslic3r/Athena/SkeletalTrapezoidation.cpp b/src/libslic3r/Athena/SkeletalTrapezoidation.cpp
+index 0dc699a..0de54ac 100644
+--- a/src/libslic3r/Athena/SkeletalTrapezoidation.cpp
++++ b/src/libslic3r/Athena/SkeletalTrapezoidation.cpp
+@@ -2406,7 +2406,8 @@ SkeletalTrapezoidation::Beading SkeletalTrapezoidation::interpolate(const Beadin
+     // TODO: don't use toolpath locations past the middle!
+     // TODO: stretch bead widths and locations of the higher bead count beading to fit in the left over space
+     coord_t next_inset_idx;
+-    for (next_inset_idx = left.toolpath_locations.size() - 1; next_inset_idx >= 0; next_inset_idx--)
++    // preflight-wasm: cast before subtracting; with 32-bit size_t an empty vector gave 4294967295 (positive in int64 -> OOB)
++    for (next_inset_idx = coord_t(left.toolpath_locations.size()) - 1; next_inset_idx >= 0; next_inset_idx--)
+     {
+         if (switching_radius > left.toolpath_locations[next_inset_idx])
+         {
 diff --git a/src/libslic3r/Brim.cpp b/src/libslic3r/Brim.cpp
 index 0f4d9b4..865972b 100644
 --- a/src/libslic3r/Brim.cpp

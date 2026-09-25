@@ -1,0 +1,64 @@
+
+== /server/thederf/slicers/preflight-wasm/build-release
+  ok   cs_version (0.0s)
+       496 options, scopes {"print":272,"machine":109,"filament":108,"other":5,"object":2}
+  ok   schema (0.1s)
+  ok   cs_eval_condition (0.1s)
+       100 layers, 3192 extrusions, 142 KiB, 1032 s, warnings 0
+  ok   cube 20mm (1.7s)
+  ok   cylinder.stl fixture (24.7s)
+  ok   multi-object, non-identity transforms, per-object config (11.4s)
+       torus: 80 layers, process 47788 ms, export 14734 ms, heap 482 MiB
+  ok   large mesh (torus, 200k triangles) (64.6s)
+  ok   torus, concentric fills, arachne perimeters (27.6s)
+  ok   torus, concentric fills, athena perimeters (33.4s)
+  ok   substitutions + unknown keys are reported, slice still succeeds (0.5s)
+       error: Layer height can't be greater than nozzle diameter
+  ok   validation error -> rc!=0 with message (0.0s)
+  ok   5 back-to-back slices on one instance (deterministic) (2.8s)
+  ok   malformed jobs -> clean error reports, no trap (0.9s)
+  ok   fresh instances (3x) each slice (74.4s)
+== build-release: 14/14 passed
+
+== /server/thederf/slicers/preflight-wasm/build-debug
+  ok   cs_version (0.0s)
+       496 options, scopes {"print":272,"machine":109,"filament":108,"other":5,"object":2}
+  ok   schema (0.1s)
+  ok   cs_eval_condition (0.1s)
+Heap resize call from 134217728 to 173867008 took 1.166756999999052 msecs. Success: true
+Heap resize call from 173867008 to 208666624 took 0.09422299999278039 msecs. Success: true
+Heap resize call from 208666624 to 292225024 took 1.2939579999947455 msecs. Success: true
+Heap resize call from 292225024 to 350683136 took 0.07962800000677817 msecs. Success: true
+       100 layers, 3192 extrusions, 142 KiB, 1032 s, warnings 0
+  ok   cube 20mm (4.1s)
+  ok   cylinder.stl fixture (92.6s)
+  ok   multi-object, non-identity transforms, per-object config (34.8s)
+Heap resize call from 350683136 to 420872192 took 1.3134560000617057 msecs. Success: true
+Heap resize call from 420872192 to 505085952 took 5.962956000003032 msecs. Success: true
+       torus: 80 layers, process 200415 ms, export 47620 ms, heap 482 MiB
+  ok   large mesh (torus, 200k triangles) (255.5s)
+  ok   torus, concentric fills, arachne perimeters (103.7s)
+  ok   torus, concentric fills, athena perimeters (130.3s)
+  ok   substitutions + unknown keys are reported, slice still succeeds (1.7s)
+       error: Layer height can't be greater than nozzle diameter
+  ok   validation error -> rc!=0 with message (0.0s)
+  ok   5 back-to-back slices on one instance (deterministic) (10.3s)
+  ok   malformed jobs -> clean error reports, no trap (3.4s)
+Heap resize call from 134217728 to 180092928 took 1.1906939999898896 msecs. Success: true
+Heap resize call from 180092928 to 216137728 took 0.10538299998734146 msecs. Success: true
+Heap resize call from 216137728 to 259391488 took 3.7928469999460503 msecs. Success: true
+Heap resize call from 259391488 to 344850432 took 1.1318569999421015 msecs. Success: true
+Heap resize call from 344850432 to 413859840 took 0.12180199997965246 msecs. Success: true
+Heap resize call from 134217728 to 180092928 took 1.2765879998914897 msecs. Success: true
+Heap resize call from 180092928 to 216137728 took 0.10200799989979714 msecs. Success: true
+Heap resize call from 216137728 to 259391488 took 4.703460999997333 msecs. Success: true
+Heap resize call from 259391488 to 344850432 took 1.309594999998808 msecs. Success: true
+Heap resize call from 344850432 to 413859840 took 0.103023000061512 msecs. Success: true
+Heap resize call from 134217728 to 180092928 took 1.2516049998812377 msecs. Success: true
+Heap resize call from 180092928 to 216137728 took 0.10038299998268485 msecs. Success: true
+Heap resize call from 216137728 to 259391488 took 4.702123000053689 msecs. Success: true
+Heap resize call from 259391488 to 344850432 took 1.29138799989596 msecs. Success: true
+Heap resize call from 344850432 to 413859840 took 0.1047350000590086 msecs. Success: true
+  ok   fresh instances (3x) each slice (280.3s)
+== build-debug: 14/14 passed
+EXIT 0

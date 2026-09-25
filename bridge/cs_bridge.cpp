@@ -597,6 +597,7 @@ EMSCRIPTEN_KEEPALIVE int cs_slice(const char *job_json, int job_len, const uint8
         *out_report_len = 0;
 
     json report = cs::make_report();
+    report["timings"] = {{"processMs", 0}, {"exportMs", 0}};
     int rc = 1;
     std::string gcode;
     try {

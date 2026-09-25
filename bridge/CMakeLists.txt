@@ -13,6 +13,9 @@ target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal nlohmann_json::nlo
 
 set(_exports "_cs_version,_cs_describe_config,_cs_slice,_cs_eval_condition,_cs_free,_malloc,_free")
 set(_runtime "HEAPU8,HEAP32,HEAPU32,UTF8ToString,stringToUTF8,lengthBytesUTF8,FS")
+# Emscripten >= 4 ignores Module keys that are not listed here (release builds, silently).
+# (csProgress is not an Emscripten setting: the EM_JS hook reads Module["csProgress"] at call time.)
+set(_incoming "locateFile,print,printErr,instantiateWasm,wasmBinary,getPreloadedPackage,onAbort,monitorRunDependencies,setStatus,noInitialRun,preRun,postRun")
 
 target_link_options(slicer PRIVATE
     -sALLOW_MEMORY_GROWTH=1
@@ -29,10 +32,13 @@ target_link_options(slicer PRIVATE
     -sINVOKE_RUN=0
     "-sEXPORTED_FUNCTIONS=[${_exports}]"
     "-sEXPORTED_RUNTIME_METHODS=[${_runtime}]"
+    "-sINCOMING_MODULE_JS_API=[${_incoming}]"
 )
 if (BUILD_VARIANT STREQUAL "debug")
     target_link_options(slicer PRIVATE -O1 -g2 -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2)
 else ()
     set(WASM_LINK_OPT "-O3" CACHE STRING "Link-time (wasm-opt) optimization level")
-    target_link_options(slicer PRIVATE ${WASM_LINK_OPT} -sSTACK_OVERFLOW_CHECK=1)
+    # STACK_OVERFLOW_CHECK=2 (not 1): the stack cannot be placed first, so without the per-function
+    # check an overflow would silently overwrite static data instead of trapping.
+    target_link_options(slicer PRIVATE ${WASM_LINK_OPT} -sSTACK_OVERFLOW_CHECK=2)
 endif ()

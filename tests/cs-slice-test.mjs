@@ -376,6 +376,16 @@ async function runSuite(buildDir) {
     });
   }
 
+  for (const gen of ['arachne', 'athena']) {
+    // Regression: SkeletalTrapezoidation::interpolate read out of bounds on wasm32 (size_t is 32-bit)
+    // for concentric fills of thin regions.
+    await t(`torus, concentric fills, ${gen} perimeters`, () => {
+      const r = slice(m, buildJob([{ name: 'torus', mesh: torus(30, 8, 120, 48), transform: translate(125, 105, 8) }],
+        { config: { perimeter_generator: gen, fill_pattern: 'concentric', top_fill_pattern: 'concentric', bottom_fill_pattern: 'concentric', fill_density: '40%' } }));
+      checkSlice(r, { expectHeight: 16, label: `concentric-${gen}` });
+    });
+  }
+
   await t('substitutions + unknown keys are reported, slice still succeeds', () => {
     const r = slice(m, buildJob([{ name: 'cube', mesh: cube(10), transform: translate(100, 100, 0) }],
       { config: { fill_pattern: 'no_such_pattern', some_orca_only_key: '1', wall_loops: 3 } }));

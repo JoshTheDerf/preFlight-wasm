@@ -39,9 +39,18 @@ traps. This port removes all of them.
   assertion is gone with emsdk 6.0.10. Debug: `-O1 -g2 -sASSERTIONS=2
   -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2` (compile `-O1 -g2`, NDEBUG kept so
   the same engine paths run as in release).
-* `-sMALLOC=dlmalloc -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB
+* `-sMALLOC=dlmalloc -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=128MB
   -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=64MB -sABORTING_MALLOC=0`; no preloaded
   files (`--preload-file` removed: nothing reads the FS at slice time).
+  `INITIAL_MEMORY` is 128 MB, not 64 MB: wasm-ld rejects 64 MB because the
+  64 MB stack plus static data does not fit.
+* `-sSTACK_OVERFLOW_CHECK=2` in release too (the stack cannot be placed first,
+  so level 1 would let an overflow silently overwrite static data).
+* `-sINCOMING_MODULE_JS_API=[locateFile,print,printErr,instantiateWasm,
+  wasmBinary,getPreloadedPackage,onAbort,monitorRunDependencies,setStatus,
+  noInitialRun,preRun,postRun]` — Emscripten ≥ 4 silently ignores other
+  factory arguments in release builds. (`csProgress` is not listed; the
+  bridge reads `Module["csProgress"]` at call time.)
 
 ## The patch (`patches/preflight-wasm.patch`)
 
@@ -66,6 +75,7 @@ re-audited. Kept / new hunks, all guarded by `EMSCRIPTEN` / `__EMSCRIPTEN__`:
 | `Platform.cpp` | Emscripten → generic Linux | otherwise `static_assert(false, "Unknown platform")` |
 | `Utils/DirectoriesUtils.cpp` | `GetDataDir()` → `/home/web_user/.config` | only Win32/Linux branches exist; unused by the bridge |
 | `PrintObject.cpp` | use `.reset()` like `__APPLE__` | libc++ finds `= {}` ambiguous for the octree `unique_ptr` pair |
+| `Arachne/` + `Athena/SkeletalTrapezoidation.cpp` | `coord_t(v.size()) - 1` in `interpolate()` | **real wasm32 OOB bug**: with 32-bit `size_t`, `size() - 1` of an empty vector is 4294967295, still positive in int64, so the `>= 0` loop read out of bounds (found by the Orca port; the rest of libslic3r was grepped for the pattern) |
 | `ShortestPath.hpp`, `ProgressConfig.hpp`, `Athena/.../SplitPromotionBeadingStrategy.cpp` | missing `#include`s | natively supplied by the precompiled header, which is off here |
 
 Dropped from the v1.0.0 patch (obsolete or replaced by real libraries):
@@ -82,12 +92,16 @@ v1.3.0 + Eigen 5).
 ## Bridge (`bridge/cs_bridge.cpp`)
 
 * Config: `DynamicPrintConfig::full_print_config()` → `set_deserialize` per key
-  (with `ForwardCompatibilitySubstitutionRule::EnableSilent`; substitutions are
-  reported) → `handle_legacy_composite()` → `normalize_fdm()`. JSON arrays are
+  with `ForwardCompatibilitySubstitutionRule::Enable` (preFlight's
+  `EnableSilent` substitutes without recording; `Enable` records, and the
+  records become `report.substitutions`; values that fail to parse and cannot
+  be substituted are skipped and reported too) → `handle_legacy_composite()` → `normalize_fdm()`. JSON arrays are
   joined the way each option parses them: `escape_strings_cstyle` (`;`,
   C-style quoting) for string vectors, `,` for numeric/bool/enum vectors, `XxY`
   for points (`[x,y]` accepted). Unknown keys become one `unknown_options`
-  warning. `binary_gcode` is forced off (warning) — the ABI returns text.
+  warning (preFlight's `handle_legacy()` would otherwise drop unknown and
+  obsolete keys silently). `binary_gcode` is forced off (warning) — the ABI
+  returns text.
 * Model: one `ModelObject`/`ModelVolume` per job object; the 4×4 transform is
   baked into the mesh in double precision (winding flipped for mirroring
   transforms, singular transforms rejected), degenerate faces removed, one

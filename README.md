@@ -56,11 +56,16 @@ Stage them into the web app with `cubby-slicer/scripts/fetch-preflight-wasm.sh`.
 
 ## Runtime notes (for the web worker)
 
-* Factory: `import PreflightModule from './slicer.mjs'`; pass `wasmBinary`
-  or `instantiateWasm`/`locateFile` as usual. No `.data` file, no preloaded
-  files: the engine reads nothing from the virtual FS.
-* Progress: set `module.csProgress = (percent, message) => {}` before calling
-  `_cs_slice`; it is called synchronously from inside the slice (0-100,
+* Factory: `import PreflightModule from './slicer.mjs'`; `await
+  PreflightModule(args)`. Only these `args` keys are honoured (Emscripten
+  `INCOMING_MODULE_JS_API`): `locateFile print printErr instantiateWasm
+  wasmBinary onAbort monitorRunDependencies setStatus noInitialRun preRun
+  postRun`. No `.data` file, no preloaded files: the engine reads nothing from
+  the virtual FS (`FS` is exported but unused).
+* Memory: initial 128 MB, grows to 4 GB; a 200k-triangle torus peaks around
+  480 MB. Stack 64 MB with overflow checks (a stack overflow traps).
+* Progress: set `module.csProgress = (percent, message) => {}` on the
+  instance (or pass it in `args`) before calling `_cs_slice`; it is called synchronously from inside the slice (0-100,
   monotone, ends at 100).
 * Exports: `_cs_version _cs_describe_config _cs_slice _cs_eval_condition
   _cs_free _malloc _free`, runtime `HEAPU8 HEAP32 HEAPU32 UTF8ToString

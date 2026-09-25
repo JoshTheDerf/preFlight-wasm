@@ -1,98 +1,77 @@
 #!/usr/bin/env bash
-# Build the preFlight->WASM module.
-# Usage: bash scripts/build-wasm.sh [-clean]
+# Build the preFlight WebAssembly engine (Cubby Slicer engine ABI).
+#
+#   BUILD_VARIANT=release|debug  (default release)  -> build-release/ or build-debug/
+#   NPROC=3                      parallel compile jobs (each emcc job ~0.5-1.5 GB)
+#   PREFLIGHT_SRC=../preflight   preFlight checkout at tag v1.3.0
+#   WASM_DEPS=../wasm-deps       shared toolchain + dependency prefix
+#   --clean                      wipe the build dir first
+#
+# Output: build-<variant>/{slicer.mjs,slicer.wasm,schema.json,version.json}
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PREFLIGHT="${ROOT}/../preflight"
-PATCH_FILE="${ROOT}/patches/preflight-wasm.patch"
-BUILD_DIR="${ROOT}/build-wasm"
+PREFLIGHT_SRC="${PREFLIGHT_SRC:-$ROOT/../preflight}"
+WASM_DEPS="${WASM_DEPS:-$ROOT/../wasm-deps}"
+PATCH_FILE="$ROOT/patches/preflight-wasm.patch"
+PREFLIGHT_TAG="v1.3.0"
+VARIANT="${BUILD_VARIANT:-release}"
+JOBS="${NPROC:-3}"
+BUILD_DIR="$ROOT/build-$VARIANT"
 
 CLEAN=0
 for arg in "$@"; do
     case "$arg" in
-        -clean|--clean) CLEAN=1 ;;
+        --clean|-clean) CLEAN=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+case "$VARIANT" in release|debug) ;; *) echo "BUILD_VARIANT must be release or debug" >&2; exit 2 ;; esac
 
-# 0) Use the portable cmake if it was bootstrapped into deps/
-if [[ -d "${ROOT}/deps/cmake-3.30.5-linux-x86_64/bin" ]]; then
-    export PATH="${ROOT}/deps/cmake-3.30.5-linux-x86_64/bin:${PATH}"
+# shellcheck disable=SC1091
+source "$WASM_DEPS/env.sh"
+command -v emcc >/dev/null || { echo "emcc not found after sourcing $WASM_DEPS/env.sh" >&2; exit 1; }
+for f in libboost_log.a libqhullstatic_r.a libexpat.a libheatshrink_dynalloc.a libnlopt.a; do
+    [[ -f "$WASM_DEPS_PREFIX/lib/$f" ]] || { echo "missing $WASM_DEPS_PREFIX/lib/$f - run: bash $WASM_DEPS/build-deps.sh (boost, preflight-extras, nlopt, ...)" >&2; exit 1; }
+done
+
+# --- preFlight checkout + patch (idempotent) ---------------------------------
+[[ -d "$PREFLIGHT_SRC/.git" ]] || { echo "preFlight checkout not found at $PREFLIGHT_SRC (git clone https://github.com/oozebot/preFlight)" >&2; exit 1; }
+head_tag="$(git -C "$PREFLIGHT_SRC" describe --tags --exact-match 2>/dev/null || true)"
+if [[ "$head_tag" != "$PREFLIGHT_TAG" ]]; then
+    echo "WARN: $PREFLIGHT_SRC is at '${head_tag:-$(git -C "$PREFLIGHT_SRC" rev-parse --short HEAD)}', expected $PREFLIGHT_TAG" >&2
 fi
-
-# 1) Activate emsdk (repo-local first, then /opt)
-if [[ -f "${ROOT}/wasm/toolchain/emsdk.env" ]]; then
-    # shellcheck disable=SC1091
-    source "${ROOT}/wasm/toolchain/emsdk.env"
-elif [[ -f "${ROOT}/deps/emsdk/emsdk_env.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "${ROOT}/deps/emsdk/emsdk_env.sh" >/dev/null
-elif [[ -f /opt/emsdk/emsdk_env.sh ]]; then
-    # shellcheck disable=SC1091
-    source /opt/emsdk/emsdk_env.sh >/dev/null
-fi
-
-if ! command -v emcc >/dev/null 2>&1; then
-    echo "ERROR: emcc not found. Run ./scripts/setup.sh first." >&2
-    exit 1
-fi
-
-if [[ ! -d "${PREFLIGHT}" ]]; then
-    echo "ERROR: preflight source tree not found at ${PREFLIGHT}" >&2
-    echo "Clone https://github.com/oozebot/preFlight.git into ${PREFLIGHT}." >&2
-    exit 1
-fi
-
-# 1.5) Drop the hand-written CMakeLists.txt files into the vendored
-# upstreams that don't ship a usable one. See vendor-cmake/README.md.
-if [[ -d "${ROOT}/deps/expat-2.6.3" && -f "${ROOT}/vendor-cmake/expat-2.6.3-CMakeLists.txt" ]]; then
-    cp "${ROOT}/vendor-cmake/expat-2.6.3-CMakeLists.txt" \
-       "${ROOT}/deps/expat-2.6.3/CMakeLists.txt"
-fi
-if [[ -d "${ROOT}/deps/heatshrink-src" && -f "${ROOT}/vendor-cmake/heatshrink-CMakeLists.txt" ]]; then
-    cp "${ROOT}/vendor-cmake/heatshrink-CMakeLists.txt" \
-       "${ROOT}/deps/heatshrink-src/CMakeLists.txt"
-fi
-
-# 2) Apply the WASM patch to preflight (idempotent)
-if [[ -f "${PATCH_FILE}" ]]; then
-    pushd "${PREFLIGHT}" >/dev/null
-    if git apply --reverse --check "${PATCH_FILE}" >/dev/null 2>&1; then
-        echo "INFO: preflight WASM patch already applied"
-    elif git apply --check "${PATCH_FILE}" >/dev/null 2>&1; then
-        git apply "${PATCH_FILE}"
-        echo "INFO: applied preflight WASM patch"
-    else
-        echo "WARN: preflight WASM patch did not apply cleanly; continuing" >&2
-    fi
-    popd >/dev/null
-fi
-
-# 3) Configure & build
-if [[ ${CLEAN} -eq 1 ]]; then
-    rm -rf "${BUILD_DIR}"
-fi
-
-# Use ccache if present — protects against full-file recompiles when an edit
-# is reverted or when emcc is invoked with an identical command line.
-CMAKE_EXTRA=()
-if [[ -x "${ROOT}/deps/ccache/ccache" ]]; then
-    export PATH="${ROOT}/deps/ccache:${PATH}"
-    export CCACHE_DIR="${ROOT}/deps/ccache-cache"
-    CMAKE_EXTRA+=(
-        -DCMAKE_C_COMPILER_LAUNCHER="${ROOT}/deps/ccache/ccache"
-        -DCMAKE_CXX_COMPILER_LAUNCHER="${ROOT}/deps/ccache/ccache"
-    )
-fi
-
-emcmake cmake -S "${ROOT}/wasm" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA[@]}"
-# NPROC defaults to 2 to avoid overwhelming the host; override with e.g. NPROC=8.
-JOBS="${NPROC:-2}"
-cmake --build "${BUILD_DIR}" -j"${JOBS}"
-
-if [[ -f "${BUILD_DIR}/slicer.js" && -f "${BUILD_DIR}/slicer.wasm" ]]; then
-    echo "OK: artifacts at ${BUILD_DIR}/slicer.js + slicer.wasm"
+if git -C "$PREFLIGHT_SRC" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+    echo "patch: already applied"
+elif git -C "$PREFLIGHT_SRC" apply --check "$PATCH_FILE" >/dev/null 2>&1; then
+    git -C "$PREFLIGHT_SRC" apply "$PATCH_FILE"
+    echo "patch: applied"
 else
-    echo "ERROR: build did not produce slicer.{js,wasm}" >&2
+    echo "ERROR: patches/preflight-wasm.patch neither applies nor is already applied to $PREFLIGHT_SRC." >&2
+    echo "       Reset the checkout (git checkout -- . && git clean -fd && git checkout $PREFLIGHT_TAG) and retry." >&2
     exit 1
 fi
+
+# --- configure + build ---------------------------------------------------------
+[[ $CLEAN -eq 1 ]] && rm -rf "$BUILD_DIR"
+LAUNCHER=()
+if command -v ccache >/dev/null; then
+    LAUNCHER=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+fi
+if [[ ! -f "$BUILD_DIR/build.ninja" ]]; then
+    emcmake cmake -S "$ROOT/wasm" -B "$BUILD_DIR" -G Ninja \
+        -DBUILD_VARIANT="$VARIANT" -DPREFLIGHT_SRC="$PREFLIGHT_SRC" \
+        -DWASM_DEPS_PREFIX="$WASM_DEPS_PREFIX" -DWASM_BRIDGE_DIR="$ROOT/../wasm-bridge" \
+        "${LAUNCHER[@]}"
+fi
+cmake --build "$BUILD_DIR" --target slicer -j"$JOBS"
+
+for f in slicer.mjs slicer.wasm; do
+    [[ -f "$BUILD_DIR/$f" ]] || { echo "ERROR: build did not produce $f" >&2; exit 1; }
+done
+
+# --- schema.json + version.json (generated by the module itself) --------------
+node "$ROOT/scripts/gen-schema.mjs" "$BUILD_DIR"
+
+ls -l "$BUILD_DIR"/slicer.mjs "$BUILD_DIR"/slicer.wasm "$BUILD_DIR"/schema.json "$BUILD_DIR"/version.json
+echo "OK: $VARIANT build in $BUILD_DIR"

@@ -21,6 +21,9 @@ deps/toolchain-wasm/*
 # in-tree.
 build-wasm/
 build/
+build-release/
+build-debug/
+build-*.log
 *.wasm
 *.o
 *.a

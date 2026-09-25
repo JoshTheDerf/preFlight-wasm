@@ -1,250 +1,127 @@
-# preFlight → WASM porting log
+# preFlight v1.3.0 → WebAssembly: porting notes
 
-## Status: ✅ Slicing works end-to-end
+This replaces the v1.0.0 port (branch `main`). The old port "worked" but ran
+with `-sEMULATE_FUNCTION_POINTER_CASTS`, JS-emulated exceptions
+(`-fexceptions`/`DISABLE_EXCEPTION_CATCHING=0`), a `-O0` link, header shims
+that shadowed real libraries (Boost.Thread/Log/Format/Optional, cereal, CGAL,
+expat, libpng, libjpeg, NLopt, OpenSSL...) and skipped `append_full_config()`
+because of a "null function" vtable trap. Those were symptoms of mixed
+ABI/exception/threading models; the web app saw "memory access out of bounds"
+traps. This port removes all of them.
 
-A clean build produces three artifacts in `build-wasm/`:
+## Build model (see cubby-slicer/docs/ENGINE-CONTRACT.md)
 
-| File | Size | Purpose |
+* Every object — preFlight, bundled deps, `../wasm-deps` archives, bridge — is
+  compiled with `-fwasm-exceptions -sSUPPORT_LONGJMP=wasm`, single-threaded
+  (no `-pthread`, Boost `threading=single`).
+* No `-sEMULATE_FUNCTION_POINTER_CASTS`, no global `operator new/delete`
+  replacement, no stub header for any library that is linked.
+* Real libraries: Boost 1.84 (filesystem, log, log_setup, regex, chrono,
+  date_time, iostreams, nowide), Eigen 5.0.1, CGAL 6.1 (header-only, with
+  preFlight's `CGAL_DISABLE_GMP` → Boost.Multiprecision), cereal, NLopt,
+  Qhull 8.1-alpha3, expat 2.6.4, heatshrink 0.4.1, nlohmann_json 3.12,
+  nanosvg (fltk fork) from `../wasm-deps`; zlib / libpng / libjpeg from the
+  Emscripten ports (`-sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_LIBJPEG=1` on every
+  compile and on the link). The extra deps were added to
+  `wasm-deps/build-deps.sh` (`preflight-extras` target).
+* Not linked: `libboost_atomic.a` (Boost's Jamfile forces `threading=multi`
+  → `-pthread` objects) and Boost.Locale (not built: no iconv/ICU; preFlight
+  only `#include`s it). Boost.Thread is not built either (see below).
+* TBB: `wasm/tbb_shim` — a sequential oneTBB replacement, the only shim.
+  Semantics kept: `simple_partitioner` splits to the grain size; pipelines are
+  type-erased `filter<I,O>` and `flow_control::stop()` never pushes the
+  input's dummy value downstream; `task_group` defers exceptions to `wait()`;
+  `enumerable_thread_specific` is lazy and `clear()` empties it;
+  `concurrent_vector` is `std::deque`-backed (stable element addresses);
+  mutexes terminate on self-deadlock instead of spinning forever.
+  `GCode.cpp`'s pipeline therefore runs unmodified (the old port rewrote it).
+* Release link: `-O3` (binaryen) — the old `-O0` workaround for a binaryen
+  assertion is gone with emsdk 6.0.10. Debug: `-O1 -g2 -sASSERTIONS=2
+  -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2` (compile `-O1 -g2`, NDEBUG kept so
+  the same engine paths run as in release).
+* `-sMALLOC=dlmalloc -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB
+  -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=64MB -sABORTING_MALLOC=0`; no preloaded
+  files (`--preload-file` removed: nothing reads the FS at slice time).
+
+## The patch (`patches/preflight-wasm.patch`)
+
+Rebuilt from scratch against v1.3.0; every hunk of the v1.0.0 patch was
+re-audited. Kept / new hunks, all guarded by `EMSCRIPTEN` / `__EMSCRIPTEN__`:
+
+| file | change | why |
 |---|---|---|
-| `slicer.js`   | ~265 KB | Emscripten loader (ES module, exports `PreflightModule`) |
-| `slicer.wasm` | ~7.3 MB | preFlight's `libslic3r` + bridge compiled to WebAssembly |
-| `slicer.data` | ~71 MB  | Preloaded `resources/` bundle (profiles, shapes, icons) |
+| `CMakeLists.txt` | Boost components without thread/process/locale/atomic | not built / not linkable single-threaded |
+| `CMakeLists.txt` | skip `find_package(CURL)`, `OpenGL`, `OpenVDB` | networking / GUI / voxel libs, not linked |
+| `CMakeLists.txt` | no `-flto` | objects stay plain wasm; wasm-opt runs at link |
+| `src/CMakeLists.txt` | skip `slic3r-arrange*`, `libseqarrange`; `return()` before CLI/GUI executables | libseqarrange needs Z3; only libslic3r is consumed |
+| `src/libslic3r/CMakeLists.txt` | drop `ArrangeHelper.cpp`, `pchheader.cpp`; don't link `libseqarrange`, `OCCTWrapper` | Z3 / OCCT not built; pchheader pulls Boost.Thread |
+| `Print.cpp` | `m_sequential_collision_detected = nullopt` | libseqarrange (Z3) collision check unavailable; `validate()`'s own clearance checks still run |
+| `Format/STEP.cpp` | `load_step` throws | OCCT not available |
+| `GCode/PostProcessor.cpp` | `run_script` returns an error | no processes in a browser (bridge never calls it) |
+| `Thread.hpp/.cpp` | no Boost.Thread; `std::thread::id` for the main-thread id; thread naming is a no-op | Boost.Thread headers require `BOOST_HAS_THREADS` (-pthread); defining it would change `shared_ptr`'s refcount layout vs the compiled Boost libs |
+| `Brim.cpp`, `TriangleMeshSlicer.cpp` | `boost::lock_guard<std::mutex>` → `std::lock_guard` | same reason; identical semantics |
+| `GCode/Thumbnails.hpp` | don't include `boost/beast/core.hpp` (only `beast/.../base64.hpp` is used) | beast/core pulls in Asio, whose config requires POSIX threads/signals |
+| `GCode/Thumbnails.cpp` | JPEG thumbnails: RGBA→RGB + `JCS_RGB` when `JCS_EXTENSIONS` is absent; include `jmorecfg.h` only with libjpeg-turbo | the Emscripten port is IJG libjpeg (no `JCS_EXT_RGBA`, no include guard) |
+| `GCode.hpp` | nop `LayerResult` id = `numeric_limits<size_t>::max()` | `coord_t` max (int64) narrows to 32-bit `size_t` (hard error); only `nop_layer_result` is ever tested |
+| `Platform.cpp` | Emscripten → generic Linux | otherwise `static_assert(false, "Unknown platform")` |
+| `Utils/DirectoriesUtils.cpp` | `GetDataDir()` → `/home/web_user/.config` | only Win32/Linux branches exist; unused by the bridge |
+| `PrintObject.cpp` | use `.reset()` like `__APPLE__` | libc++ finds `= {}` ambiguous for the octree `unique_ptr` pair |
+| `ShortestPath.hpp`, `ProgressConfig.hpp`, `Athena/.../SplitPromotionBeadingStrategy.cpp` | missing `#include`s | natively supplied by the precompiled header, which is off here |
 
-Reference test (cylinder.stl from preFlight's shipped resources):
+Dropped from the v1.0.0 patch (obsolete or replaced by real libraries):
+TBB-optional CMake, EXPAT/PNG/NLopt/Qhull/JPEG gating (real libs now),
+`hidapi` (GUI-only in v1.3.0), `PNGReadWrite.cpp` stubs (real libpng),
+`its_convex_hull` stub (real Qhull), `VoronoiUtilsCgal.cpp` "always planar"
+stub (real CGAL), `GCode.cpp` sequential pipeline rewrite and the
+`append_full_config()` skip (the full `; preflight_config` block is emitted
+again), `FuzzySkin` seed tweak, `Model.cpp`/`LayerRegion`/`ObjectID`/
+`SurfaceCollection`/`InterlockingGenerator` include hunks and the
+`AABBTreeLines`/`SupportSpotsGenerator` Eigen cast hoists (not needed with
+v1.3.0 + Eigen 5).
 
-```
-$ node tests/slice-test.cjs
-STL bytes: 72084
-Module loaded, attempting slice...
-[wasm] [pflt_slice] start len=72084
-[wasm] ... (slice phase 0% → 33%, 13s) ...
-[wasm] [pflt_slice] export complete wall_time_ms=10298.82
-[wasm] [pflt_slice] retrieved gcode from in-memory object, size=1332851
-orc_slice rc= 0
-OK gcode len= 1332851
-```
+## Bridge (`bridge/cs_bridge.cpp`)
 
-The output is valid preFlight G-code: header, layer-change markers,
-standard moves, filament stats footer. Confirmed in both Node 22 and in
-a browser tab via the cad-project consumer.
+* Config: `DynamicPrintConfig::full_print_config()` → `set_deserialize` per key
+  (with `ForwardCompatibilitySubstitutionRule::EnableSilent`; substitutions are
+  reported) → `handle_legacy_composite()` → `normalize_fdm()`. JSON arrays are
+  joined the way each option parses them: `escape_strings_cstyle` (`;`,
+  C-style quoting) for string vectors, `,` for numeric/bool/enum vectors, `XxY`
+  for points (`[x,y]` accepted). Unknown keys become one `unknown_options`
+  warning. `binary_gcode` is forced off (warning) — the ABI returns text.
+* Model: one `ModelObject`/`ModelVolume` per job object; the 4×4 transform is
+  baked into the mesh in double precision (winding flipped for mirroring
+  transforms, singular transforms rejected), degenerate faces removed, one
+  identity instance; per-object config → `ModelObject::config`; `dropToBed` →
+  `ensure_on_bed()`. As in the preFlight CLI, instances not fully inside the
+  build volume are skipped (warning `outside_bed`); nothing left → error.
+* `Print::apply` → `validate(&warnings)` (errors → rc 3) → `process()` →
+  `export_gcode("", &result)` (memory mode: text from
+  `result.gcode_object->text_buffer()`). Stats: normal-mode time, per-extruder
+  volume → mm / cm³ / g / cost from filament diameter/density/cost, distinct
+  layer `print_z` count (objects + supports), max `print_z`. Warnings: apply,
+  validate and all print/object step warnings (deduplicated).
+* Every exported function catches `std::exception` and `...`; rc: 0 ok,
+  2 invalid job, 3 engine error, 4 out of memory. Each call owns its
+  Model/Print/result, so repeated slices on one instance are independent.
+* `cs_eval_condition`: same config construction, then
+  `PlaceholderParser::evaluate_boolean_expression`. Empty → 1, parse/eval
+  error → -1, bad config JSON → -2.
+* `cs_describe_config`: all FFF keys of `print_config_def` present in
+  `FullPrintConfig` or in `Preset::{print,filament,printer}_options()`;
+  `scope` from those preset lists (`object` for object/region-only keys).
 
-## Building
+## Disabled / not supported
 
-```bash
-cd preflight-wasm
+* Sequential-print (`complete_objects`) collision detection via libseqarrange
+  (Z3). preFlight's `Print::validate` extruder-clearance check still applies.
+* Arrange (the app positions objects), STEP import, OpenVDB-based features,
+  G-code post-processing scripts, Python pre-processor, binary G-code output,
+  thumbnails (no thumbnail callback is passed).
+* Multi-threading.
 
-# 1. one-time bootstrap (emsdk, portable cmake, ccache, vendored single-headers)
-./scripts/setup.sh
+## Remaining workarounds
 
-# 2. cross-build Boost 1.83 (threading=single, BOOST_LOG_WITHOUT_{SYSLOG,EVENT_LOG,DEBUG_OUTPUT,IPC})
-bash deps/boost-wasm/build_boost.sh
-
-# 3. cross-build GMP + MPFR + CGAL 6.1
-bash deps/toolchain-wasm/build_math.sh
-
-# 4. clone preFlight sibling
-(cd .. && git clone https://github.com/oozebot/preFlight.git preflight)
-
-# 5. build the WASM slicer (auto-applies patches/preflight-wasm.patch)
-#    cap NPROC ≤ 4 (each emcc job uses ~500 MB)
-NPROC=4 bash scripts/build-wasm.sh
-```
-
-ccache is wired in (`deps/ccache/`). Re-runs of identical compilations
-hit the cache.
-
-## What the port does
-
-### Bridge (`bridge/preflight_wrap.cpp`)
-
-Originally translated from orcaslicer-wasm's `wasm_wrap.cpp`. preFlight
-diverged from OrcaSlicer enough that several translations were needed:
-
-- includes retargeted to `../../preflight/src/libslic3r/`
-- class rename: `GCode` → `GCodeGenerator`
-- removed orca-only calls: `set_temporary_dir`, `Print::get_plate_origin`,
-  `GCode::set_gcode_offset`, `DynamicPrintConfig::set_num_filaments`
-- `load_stl` signature: 3 args (preflight) instead of 5 (orca)
-- `comDevelop` → `comExpert` (preflight enum value)
-- `def.enum_keys_map` → `def.enum_def->value_to_index()` (preflight
-  encapsulated enum metadata into `ConfigOptionEnumDef`)
-- `build_config_schema()` simplified to skip metadata preflight doesn't expose
-- C entry points kept as `orc_init` / `orc_slice` / `orc_describe_config`
-  for orcaslicer-wasm web frontend compatibility
-
-**Two important bridge-side fixes for working slicing:**
-
-1. **In-memory G-code retrieval.** preFlight's `do_export()` uses
-   memory-based processing: it constructs the G-code in a `GCodeObject`
-   buffer and only writes to disk if you pass a `GCodeProcessorResult*`.
-   The bridge passes one, then reads `result.gcode_object->text_buffer()`
-   for the JS side. The original bridge passed only a path and got back
-   an empty file.
-
-2. **Disabled global `operator new`/`operator delete` overrides.** The
-   bridge used to install instrumented overrides for failed-alloc debug
-   logging. Combined with `-sEMULATE_FUNCTION_POINTER_CASTS=1` and
-   `-fexceptions`, these overrides interfered with libcxxabi's exception
-   machinery: `__cxa_throw` would resolve a thunk-table entry to function
-   index 0 (the trap thunk), surfacing as a "null function" trap during
-   G-code finalization. Wrapping the overrides in `#if 0` (so libcxx's
-   canonical operator new/delete are used) cleared the trap.
-
-### Patch (`patches/preflight-wasm.patch`, ~940 lines, 27 files)
-
-Idempotent; applies cleanly to a fresh preflight checkout.
-
-**Build system gating (under `EMSCRIPTEN` / `NOT EMSCRIPTEN`):**
-
-- Root `CMakeLists.txt`: make TBB optional; gate `find_package`
-  CURL / OpenGL / NLopt / EXPAT / PNG / OpenVDB.
-- `bundled_deps/hidapi/CMakeLists.txt`: Emscripten short-circuit.
-- `src/CMakeLists.txt`: gate `slic3r-arrange`, `slic3r-arrange-wrapper`,
-  `libseqarrange`, `occt_wrapper`, Qhull; early `return()` to skip native
-  CLI/GUI.
-- `src/libslic3r/CMakeLists.txt`: add `SLIC3R_WITH_OCCT` /
-  `SLIC3R_WITH_OPENCV` options; gate `libjpeg-turbo`; gate `libseqarrange`
-  from the link line; `list(REMOVE_ITEM SLIC3R_SOURCES ArrangeHelper.cpp
-  ArrangeHelper.hpp)` under EMSCRIPTEN; define `SLIC3R_NO_SEQARRANGE`.
-
-**Pipeline rewrites:**
-
-- `GCode.cpp` — both `process_layers()` variants use `tbb::filter<I, O>`
-  type erasure that the wasm_shims TBB stub does not provide. Both are
-  driven by a hand-rolled sequential loop under `__EMSCRIPTEN__`:
-
-  ```cpp
-  tbb::flow_control fc;
-  while (!fc.is_stopped()) {
-      auto p = smooth_path_interpolator(fc);
-      if (fc.is_stopped()) break;
-      auto lr = generator(std::move(p));
-      if (m_spiral_vase)        lr = spiral_vase(std::move(lr));
-      if (m_pressure_equalizer) lr = pressure_equalizer(std::move(lr));
-      lr = arc_handler(std::move(lr));
-      auto str = cooling(std::move(lr));
-      if (m_find_replace) str = find_replace(std::move(str));
-      output(std::move(str));
-  }
-  ```
-
-**Post-export workaround for `append_full_config()`:**
-
-- `GCode.cpp` — `append_full_config()` is skipped under `__EMSCRIPTEN__`.
-  Its call to `cfg.keys()` (a virtual on `DynamicConfig`) on
-  `Print::m_full_print_config` traps with "null function" *before*
-  entering the function body — the virtual dispatch resolves to function
-  table index 0. Three other prior `DynamicConfig::keys()` calls in the
-  same slice succeed, so this is specific to that one object's vtable.
-  Strong suspect: a thunk-table issue caused by
-  `-sEMULATE_FUNCTION_POINTER_CASTS=1` + `-fexceptions`. The block this
-  would emit is purely informational (`; preflight_config = …` G-code
-  comments), so skipping is benign. Documented as an open issue in
-  README.md.
-
-**Other source-level guards:**
-
-- `PNGReadWrite.cpp` — whole file gated; nop stubs (libpng not built for WASM).
-- `TriangleMesh.cpp` — `its_convex_hull` early-returns under EMSCRIPTEN
-  (Qhull unavailable); qhull includes gated.
-- `Print.cpp` — `ArrangeHelper.hpp` include + `check_seq_conflict()` gated.
-- `GCode/PostProcessor.cpp` — stubbed `run_script()` (Boost.Process v2 not
-  in Boost 1.83).
-- `PrintObject.cpp` — extend Apple `unique_ptr` `= {}` workaround to
-  Emscripten (same libc++ ambiguity).
-- `Utils/DirectoriesUtils.cpp` — add EMSCRIPTEN branch returning `/data`
-  MEMFS path.
-- `Geometry/VoronoiUtilsCgal.cpp` — explicit template instantiations
-  re-added inside the EMSCRIPTEN branch so
-  `is_voronoi_diagram_planar_angle` linker symbols resolve.
-- Transitive `<unordered_set>` / `<vector>` additions for files that
-  previously got them via PCH on native builds: `LayerRegion.cpp`,
-  `ObjectID.cpp`, `SurfaceCollection.cpp`,
-  `Feature/Interlocking/InterlockingGenerator.{cpp,hpp}`,
-  `ProgressConfig.hpp`, `ShortestPath.hpp`.
-- `Model.cpp` — add `<tbb/parallel_for.h>` + `<tbb/blocked_range.h>`.
-- `SupportSpotsGenerator.cpp` — hoist Eigen `cast<double>()` to named
-  variables (Eigen 3.4 returns `CwiseUnaryOp` which doesn't implicitly
-  convert to `Vec<...>`).
-
-The conflicting `boost/log/trivial.hpp` shims under
-`wasm_shims/boost/log/` and `wasm_shims/boost_runtime/boost/log/` were
-removed entirely; static Boost.Log links against its own real header.
-
-### Dependencies
-
-| Dep | Source | How |
-|---|---|---|
-| Boost 1.83 | `deps/boost-wasm/build_boost.sh` | cross-built static, `threading=single`, `BOOST_LOG_WITHOUT_{SYSLOG,EVENT_LOG,DEBUG_OUTPUT,IPC}` |
-| Eigen 3.4 | `deps/eigen/` | header-only |
-| nlohmann_json 3.11 | `deps/nlohmann_json/` | single-header, `Findnlohmann_json.cmake` + `nlohmann_jsonConfig.cmake` |
-| nanosvg | `deps/nanosvg/` | single-header |
-| EXPAT 2.6.3 | `deps/expat-2.6.3/` | tarball + custom minimal `CMakeLists.txt` (xmlparse + xmlrole + xmltok, `XML_POOR_ENTROPY`) |
-| heatshrink 0.4.1 | `deps/heatshrink-src/` | tarball + custom `CMakeLists.txt` exposing `heatshrink::heatshrink_dynalloc` |
-| GMP / MPFR | `deps/toolchain-wasm/build_math.sh` | cross-built |
-| CGAL 6.1 | `deps/toolchain-wasm/build_math.sh` | cross-built (5.4 was originally tried; 6.1 needed because preflight uses `AABB_traits_3` + std::optional `property_map<>`) |
-| TBB | `wasm/wasm_shims/tbb/` + `oneapi/tbb/` | header-only shim, `namespace oneapi::tbb` with `tbb = oneapi::tbb` alias |
-| zlib | emscripten port (`-sUSE_ZLIB=1`) | built-in |
-| LibBGCode | preflight's `bundled_deps/libbgcode/` (re-enabled in patch) | source build |
-| OCCT, OpenVDB, OpenCV, OpenGL, CURL, NLopt, Qhull, libpng, libjpeg-turbo | gated out / stubbed | INTERFACE IMPORTED targets only |
-
-## Notable workarounds
-
-- **`-O0` link.** wasm-opt asserts internally on aggressive optimization
-  (`binaryen ArenaVector` OOB) with our libslic3r.wasm; both `-O3` and `-O2`
-  link triggered it. Per-TU `-O3` compile flags are preserved, so the `.o`
-  files are optimized — only the final wasm-opt pass is skipped. Worth
-  re-trying after an emsdk upgrade.
-- **`-sEMULATE_FUNCTION_POINTER_CASTS=1`.** Required for the build to load
-  at all. Removing it (we tried) caused module-instantiation `LinkError`
-  on a real signature mismatch somewhere in libcxxabi exception unwinding.
-  This flag is implicated in the `append_full_config()` vtable trap and is
-  worth investigating further.
-- **TBB shim namespace pattern.** All shim headers use
-  `namespace oneapi::tbb { ... }` with `namespace tbb = oneapi::tbb;`
-  aliased at the bottom; any shim that uses `namespace tbb { ... }`
-  directly will conflict with this alias.
-- **Boost.Log namespace mismatch.** Boost.Log's `boost::log::v2*`
-  namespace varies by `BOOST_LOG_NO_THREADS` × `BOOST_LOG_STATIC_LINK`.
-  Static + single-threaded matches at consumer (no `BOOST_HAS_THREADS`)
-  ↔ lib (built with `threading=single`).
-- **Bridge → slicer linkage.** The `slicer` executable does **not**
-  re-compile `preflight_wrap.cpp`; it links the already-built
-  `libpreflight_wasm_bridge.a` with `-Wl,--whole-archive` so the C entry
-  points survive static linking.
-
-## Open issues to investigate
-
-1. **Root-cause the `append_full_config()` vtable trap.** Most likely an
-   `-sEMULATE_FUNCTION_POINTER_CASTS=1` thunk-table issue. If we can get
-   the binary to load without that flag (currently blocked on a real
-   signature mismatch), the workaround in the patch can be removed.
-2. **`-O3` link.** Re-test under a newer emsdk; the binaryen
-   `ArenaVector` assertion may be fixed upstream, which would let us
-   shrink the wasm and recover the optimizer's wasm-opt pass.
-3. **Trim `slicer.data`.** The 71 MB preload covers the full `resources/`
-   tree (profiles, shapes, icons, hint files, language packs). The bridge
-   probably needs only a small subset — `set_resources_dir`,
-   `set_var_dir`, `set_sys_shapes_dir` etc. give us hooks to point at
-   trimmed dirs.
-4. **Wipe-tower & sequential-print modes.** The patch covers both
-   `process_layers` variants but only the parallel-mode variant has been
-   exercised by tests. A multi-extruder model with `complete_objects=true`
-   would hit the sequential variant.
-5. **G-code post-processing.** preFlight's `run_script` is stubbed
-   under WASM. Plugin / postprocess hooks aren't supported in the
-   browser yet.
-
-## What's NOT implemented
-
-- Arrange features (auto-arrange, sequential collision detection).
-- Convex hull (Qhull) — `its_convex_hull` returns empty.
-- STEP / CAD imports (OCCT off).
-- JPEG / PNG thumbnail encoding.
-- Binary G-code conversion that actually compresses (LibBGCode binarize
-  is compiled but the heatshrink runtime path is exercised only if a
-  consumer calls into it).
-- Python pre-processor (`SLIC3R_PYTHON_PREPROCESSOR=OFF`).
-- wxWidgets GUI (`SLIC3R_GUI=OFF`).
-- Multi-threading (Emscripten built single-threaded — no
-  SharedArrayBuffer / pthread).
+* The TBB shim (sequential).
+* Boost.Thread-free `Thread.hpp`/`Thread.cpp` under `__EMSCRIPTEN__`.
+* Local `Findcereal.cmake`: cereal's installed version file rejects 32-bit
+  consumers (generated on a 64-bit host); the headers are used directly.

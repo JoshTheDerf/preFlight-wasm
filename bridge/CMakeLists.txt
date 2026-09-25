@@ -1,44 +1,38 @@
-add_library(preflight_wasm_bridge STATIC preflight_wrap.cpp)
+# The engine module: cs_bridge.cpp + libslic3r -> slicer.mjs / slicer.wasm.
+find_package(nlohmann_json 3.11 REQUIRED CONFIG)
 
-# nlohmann_json header is a single-header bundled at ../deps/nlohmann_json.
-target_include_directories(preflight_wasm_bridge PUBLIC
-    ${CMAKE_CURRENT_LIST_DIR}/../deps/nlohmann_json/include
+add_executable(slicer cs_bridge.cpp)
+set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs"
+                                        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+target_compile_features(slicer PRIVATE cxx_std_20)
+target_include_directories(slicer PRIVATE "${WASM_BRIDGE_DIR}")
+target_compile_definitions(slicer PRIVATE CS_BUILD_VARIANT="${BUILD_VARIANT}")
+# libslic3r's PRIVATE deps (Boost, Qhull, CGAL glue, expat, heatshrink, ports)
+# propagate to this link as LINK_ONLY because it is a static library.
+target_link_libraries(slicer PRIVATE libslic3r libslic3r_cgal nlohmann_json::nlohmann_json)
+
+set(_exports "_cs_version,_cs_describe_config,_cs_slice,_cs_eval_condition,_cs_free,_malloc,_free")
+set(_runtime "HEAPU8,HEAP32,HEAPU32,UTF8ToString,stringToUTF8,lengthBytesUTF8,FS")
+
+target_link_options(slicer PRIVATE
+    -sALLOW_MEMORY_GROWTH=1
+    -sMAXIMUM_MEMORY=4GB
+    -sINITIAL_MEMORY=128MB  # 64MB cannot hold the 64MB stack + static data
+    -sSTACK_SIZE=64MB
+    -sABORTING_MALLOC=0
+    -sMALLOC=dlmalloc
+    -sMODULARIZE=1
+    -sEXPORT_ES6=1
+    -sEXPORT_NAME=PreflightModule
+    -sENVIRONMENT=web,worker,node
+    -sEXIT_RUNTIME=0
+    -sINVOKE_RUN=0
+    "-sEXPORTED_FUNCTIONS=[${_exports}]"
+    "-sEXPORTED_RUNTIME_METHODS=[${_runtime}]"
 )
-if (TARGET nlohmann_json::nlohmann_json)
-    target_link_libraries(preflight_wasm_bridge PUBLIC nlohmann_json::nlohmann_json)
+if (BUILD_VARIANT STREQUAL "debug")
+    target_link_options(slicer PRIVATE -O1 -g2 -sASSERTIONS=2 -sSAFE_HEAP=1 -sSTACK_OVERFLOW_CHECK=2)
+else ()
+    set(WASM_LINK_OPT "-O3" CACHE STRING "Link-time (wasm-opt) optimization level")
+    target_link_options(slicer PRIVATE ${WASM_LINK_OPT} -sSTACK_OVERFLOW_CHECK=1)
 endif ()
-
-# Expose bridge headers alongside preFlight core and shim headers so consumers
-# (including the standalone slicer executable) compile without chasing include
-# paths manually.
-target_include_directories(preflight_wasm_bridge BEFORE PUBLIC
-    ${CMAKE_CURRENT_LIST_DIR}/../wasm/wasm_shims
-    ${CMAKE_CURRENT_LIST_DIR}/../wasm/wasm_shims/boost_runtime
-    ${CMAKE_CURRENT_LIST_DIR}/../wasm/wasm_shims/libslic3r
-)
-
-target_include_directories(preflight_wasm_bridge
-    PUBLIC
-        ${CMAKE_CURRENT_LIST_DIR}
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/src
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/src/clipper2/include
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/admesh
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/libbgcode
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/libbgcode/LibBGCode
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/libigl
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/libnest2d/include
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/semver
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/tcbspan
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/fast_float
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/int128
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/agg
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/ankerl
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/miniz
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/localesutils
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps/stb_image
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/deps_src
-        ${CMAKE_CURRENT_LIST_DIR}/../../preflight/deps_src/eigen
-        ${CMAKE_CURRENT_LIST_DIR}/../deps/eigen
-        ${CMAKE_CURRENT_LIST_DIR}/../deps/nanosvg
-        ${BOOST_INC}
-)

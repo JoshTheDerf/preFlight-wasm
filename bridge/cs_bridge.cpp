@@ -227,44 +227,45 @@ void report_apply_log(json &report, const ApplyLog &log)
 }
 
 // ------------------------------------------------------------------- model
-TriangleMesh make_mesh(cs::MeshInput &m)
+// Mesh-local vertices → bed coordinates. The host already flips the winding
+// of mirrored transforms (see ENGINE-CONTRACT.md), so indices are used as
+// given; an inside-out result is corrected via the signed volume.
+TriangleMesh make_mesh(std::vector<float> &positions, std::vector<uint32_t> &indices, const double *t, const std::string &name)
 {
-    const double *t = m.transform; // column-major
-    const size_t nv = m.positions.size() / 3;
+    const size_t nv = positions.size() / 3;
     indexed_triangle_set its;
     its.vertices.reserve(nv);
     for (size_t i = 0; i < nv; ++i) {
-        const double x = m.positions[3 * i], y = m.positions[3 * i + 1], z = m.positions[3 * i + 2];
+        const double x = positions[3 * i], y = positions[3 * i + 1], z = positions[3 * i + 2];
         const double X = t[0] * x + t[4] * y + t[8] * z + t[12];
         const double Y = t[1] * x + t[5] * y + t[9] * z + t[13];
         const double Z = t[2] * x + t[6] * y + t[10] * z + t[14];
         const float fx = float(X), fy = float(Y), fz = float(Z);
         if (!std::isfinite(fx) || !std::isfinite(fy) || !std::isfinite(fz))
-            throw cs::JobError(m.name + ": transformed vertex is not finite");
+            throw cs::JobError(name + ": transformed vertex is not finite");
         its.vertices.emplace_back(fx, fy, fz);
     }
-    // A mirroring transform flips the winding; keep facets facing outwards.
     const double det = t[0] * (t[5] * t[10] - t[9] * t[6]) - t[4] * (t[1] * t[10] - t[9] * t[2]) +
                        t[8] * (t[1] * t[6] - t[5] * t[2]);
     if (!(std::abs(det) > 1e-12))
-        throw cs::JobError(m.name + ": transform is singular");
-    const size_t nt = m.indices.size() / 3;
+        throw cs::JobError(name + ": transform is singular");
+    const size_t nt = indices.size() / 3;
     its.indices.reserve(nt);
     for (size_t i = 0; i < nt; ++i) {
-        int a = int(m.indices[3 * i]), b = int(m.indices[3 * i + 1]), c = int(m.indices[3 * i + 2]);
-        if (det < 0)
-            std::swap(b, c);
-        its.indices.emplace_back(a, b, c);
+        its.indices.emplace_back(int(indices[3 * i]), int(indices[3 * i + 1]), int(indices[3 * i + 2]));
     }
     // The input is no longer needed; free it before the engine allocates.
-    std::vector<float>().swap(m.positions);
-    std::vector<uint32_t>().swap(m.indices);
+    std::vector<float>().swap(positions);
+    std::vector<uint32_t>().swap(indices);
 
     its_remove_degenerate_faces(its);
     if (its.indices.empty())
-        throw cs::JobError(m.name + ": mesh has no non-degenerate triangles");
+        throw cs::JobError(name + ": mesh has no non-degenerate triangles");
     its_compactify_vertices(its);
-    return TriangleMesh(std::move(its));
+    TriangleMesh mesh(std::move(its));
+    if (mesh.volume() < 0)
+        mesh.flip_triangles();
+    return mesh;
 }
 
 // ------------------------------------------------------------------ stats
@@ -431,8 +432,26 @@ int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_
     for (cs::MeshInput &m : job.objects) {
         ModelObject *mo = model.add_object();
         mo->name = m.name;
-        ModelVolume *mv = mo->add_volume(make_mesh(m));
+        ModelVolume *mv = mo->add_volume(make_mesh(m.positions, m.indices, m.transform, m.name));
         mv->name = m.name;
+        // Extra volumes: parts, negative parts, modifiers, support blockers / enforcers.
+        for (cs::VolumeInput &p : m.parts) {
+            const ModelVolumeType type = p.type == "negative"         ? ModelVolumeType::NEGATIVE_VOLUME
+                                       : p.type == "modifier"         ? ModelVolumeType::PARAMETER_MODIFIER
+                                       : p.type == "support_blocker"  ? ModelVolumeType::SUPPORT_BLOCKER
+                                       : p.type == "support_enforcer" ? ModelVolumeType::SUPPORT_ENFORCER
+                                                                      : ModelVolumeType::MODEL_PART;
+            ModelVolume *pv = mo->add_volume(make_mesh(p.positions, p.indices, p.transform, p.name), type);
+            pv->name = p.name;
+            if (!p.config.empty()) {
+                ApplyLog vlog;
+                apply_json_config(pv->config, p.config, vlog, p.name + ".");
+                for (auto &sub : vlog.substitutions)
+                    log.substitutions.push_back(sub);
+                for (auto &k : vlog.unknown)
+                    log.unknown.push_back(k);
+            }
+        }
         mo->add_instance();
         if (!m.config.empty()) {
             ApplyLog olog;

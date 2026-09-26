@@ -1,11 +1,11 @@
 # The engine module: cs_bridge.cpp + libslic3r -> slicer.mjs / slicer.wasm.
 find_package(nlohmann_json 3.11 REQUIRED CONFIG)
 
-add_executable(slicer cs_bridge.cpp)
+add_executable(slicer cs_bridge.cpp "${WASM_BRIDGE_DIR}/cs_fast_strtod.cpp")
 set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs"
                                         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_features(slicer PRIVATE cxx_std_20)
-target_include_directories(slicer PRIVATE "${WASM_BRIDGE_DIR}")
+target_include_directories(slicer PRIVATE "${WASM_BRIDGE_DIR}" "${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps")
 target_compile_definitions(slicer PRIVATE CS_BUILD_VARIANT="${BUILD_VARIANT}")
 # libslic3r's PRIVATE deps (Boost, Qhull, CGAL glue, expat, heatshrink, ports)
 # propagate to this link as LINK_ONLY because it is a static library.
@@ -18,6 +18,8 @@ set(_runtime "HEAPU8,HEAP32,HEAPU32,UTF8ToString,stringToUTF8,lengthBytesUTF8,FS
 set(_incoming "locateFile,print,printErr,instantiateWasm,wasmBinary,getPreloadedPackage,onAbort,monitorRunDependencies,setStatus,noInitialRun,preRun,postRun")
 
 target_link_options(slicer PRIVATE
+    # musl strtod parses via 128-bit soft-float long double; route it to fast_float.
+    -Wl,--wrap=strtod -Wl,--wrap=strtof
     -sALLOW_MEMORY_GROWTH=1
     -sMAXIMUM_MEMORY=4GB
     -sINITIAL_MEMORY=128MB  # 64MB cannot hold the 64MB stack + static data

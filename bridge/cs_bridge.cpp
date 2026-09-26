@@ -17,6 +17,7 @@
 #include <libslic3r/MultipleBeds.hpp>
 #include <libslic3r/Exception.hpp>
 #include <libslic3r/Model.hpp>
+#include <libslic3r/OrcaGCodeAliases.hpp>
 #include <libslic3r/PlaceholderParser.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/Print.hpp>
@@ -32,6 +33,8 @@
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -335,6 +338,82 @@ double ms_since(std::chrono::steady_clock::time_point t0)
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// ---------------------------------------------------------------- placeholder vars
+// Orca-profile compatibility: custom G-code from OrcaSlicer vendor profiles
+// references options preFlight doesn't define (activate_air_filtration,
+// flush_temperatures, ...) and Orca's computed variables. The host sends their
+// (Orca-resolved) values with Orca schema types; each one preFlight neither
+// defines nor aliases is registered on the print's placeholder parser, which
+// G-code export copies. Values that fail to parse are skipped.
+ConfigOption *make_placeholder_option(const std::string &type, const json &value)
+{
+    auto join = [&](const char *sep) {
+        if (!value.is_array()) return cs::scalar_to_string(value);
+        std::string out;
+        for (size_t i = 0; i < value.size(); ++i) { if (i) out += sep; out += cs::scalar_to_string(value[i]); }
+        return out;
+    };
+    auto first = [&]() { return value.is_array() ? (value.empty() ? std::string() : cs::scalar_to_string(value[0])) : cs::scalar_to_string(value); };
+    std::unique_ptr<ConfigOption> opt;
+    std::string text;
+    if (type == "strings") {
+        std::vector<std::string> v;
+        if (value.is_array()) for (const json &e : value) v.push_back(cs::scalar_to_string(e));
+        else v.push_back(cs::scalar_to_string(value));
+        return new ConfigOptionStrings(v);
+    }
+    if (type == "string" || type == "enum") return new ConfigOptionString(first());
+    if (type == "bool")               { opt.reset(new ConfigOptionBool());            text = first(); }
+    else if (type == "int")           { opt.reset(new ConfigOptionInt());             text = first(); }
+    else if (type == "float")         { opt.reset(new ConfigOptionFloat());           text = first(); }
+    else if (type == "percent")       { opt.reset(new ConfigOptionPercent());         text = first(); }
+    else if (type == "floatOrPercent"){ opt.reset(new ConfigOptionFloatOrPercent());  text = first(); }
+    else if (type == "bools")         { opt.reset(new ConfigOptionBools());           text = join(","); }
+    else if (type == "ints")          { opt.reset(new ConfigOptionInts());            text = join(","); }
+    else if (type == "floats")        { opt.reset(new ConfigOptionFloats());          text = join(","); }
+    else if (type == "percents")      { opt.reset(new ConfigOptionPercents());        text = join(","); }
+    else if (type == "floatsOrPercents") { opt.reset(new ConfigOptionFloatsOrPercents()); text = join(","); }
+    else if (type == "point")         { opt.reset(new ConfigOptionPoint());           text = first(); }
+    else if (type == "points")        { opt.reset(new ConfigOptionPoints());          text = join(","); }
+    else return nullptr;
+    // Orca serialises bools as true/false in places; ConfigOptionBool wants 1/0.
+    if (type == "bool" || type == "bools") {
+        for (const char *w : {"true", "false"}) for (size_t p; (p = text.find(w)) != std::string::npos;) text.replace(p, std::strlen(w), w[0] == 't' ? "1" : "0");
+    }
+    try {
+        if (!opt->deserialize(text)) return nullptr;
+    } catch (...) { return nullptr; }
+    return opt.release();
+}
+
+int apply_placeholder_vars(Print &print, const json &vars)
+{
+    if (!vars.is_object() || vars.empty()) return 0;
+    auto &parser = const_cast<PlaceholderParser &>(print.placeholder_parser());
+    const auto &aliases = orca_gcode_aliases();
+    int n = 0;
+    for (auto it = vars.begin(); it != vars.end(); ++it) {
+        const std::string &key = it.key();
+        if (key.empty() || key.size() > 128 || !it->is_object()) continue;
+        if (print_config_def.has(key) || parser.config().has(key)) continue;
+        const json &spec = *it;
+        const std::string type = spec.value("type", std::string());
+        auto v = spec.find("value");
+        if (v == spec.end()) continue;
+        std::unique_ptr<ConfigOption> opt(make_placeholder_option(type, *v));
+        if (!opt) continue;
+        // An Orca alias wins unless it changes the shape: e.g. Orca's scalar
+        // bed_temperature_initial_layer_single aliases preFlight's per-extruder
+        // first_layer_bed_temperature, which `{if bed_temperature_initial_layer_single < 71}`
+        // can't use. A direct variable is looked up before aliases.
+        if (auto a = aliases.find(key); a != aliases.end())
+            if (const ConfigOptionDef *def = print_config_def.get(a->second); def && def->is_scalar() == opt->is_scalar()) continue;
+        parser.set(key, opt.release());
+        ++n;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------- slicing
 int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_len, std::string &gcode, json &report)
 {
@@ -398,6 +477,7 @@ int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_
     std::unordered_set<std::string> seen;
     for (const std::string &w : apply_warnings)
         add_warning(report, "apply", w, &seen);
+    apply_placeholder_vars(print, job.placeholder_vars);
 
     if (print.empty())
         throw Slic3r::SlicingError("Nothing to print: no object is inside the print volume or all objects are empty");

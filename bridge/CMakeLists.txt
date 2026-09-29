@@ -5,7 +5,7 @@ add_executable(slicer cs_bridge.cpp "${WASM_BRIDGE_DIR}/cs_fast_strtod.cpp")
 set_target_properties(slicer PROPERTIES OUTPUT_NAME "slicer" SUFFIX ".mjs"
                                         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_features(slicer PRIVATE cxx_std_20)
-target_include_directories(slicer PRIVATE "${WASM_BRIDGE_DIR}" "${CMAKE_CURRENT_LIST_DIR}/../../preflight/bundled_deps")
+target_include_directories(slicer PRIVATE "${WASM_BRIDGE_DIR}" "${PREFLIGHT_SRC}/bundled_deps")
 target_compile_definitions(slicer PRIVATE CS_BUILD_VARIANT="${BUILD_VARIANT}")
 # libslic3r's PRIVATE deps (Boost, Qhull, CGAL glue, expat, heatshrink, ports)
 # propagate to this link as LINK_ONLY because it is a static library.

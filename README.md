@@ -17,7 +17,9 @@ patches/preflight-wasm.patch   applied to ../preflight (tag v1.3.0); regenerate 
 wasm/CMakeLists.txt            superbuild: flags, dependency lookup, preFlight options
 wasm/cmake/                    Find modules: TBB (-> shim), ZLIB/PNG/JPEG (-> Emscripten ports), cereal
 wasm/tbb_shim/                 sequential oneTBB replacement (the only "shim" in the build)
-bridge/cs_bridge.cpp           engine ABI implementation (uses ../wasm-bridge/cs_common.hpp)
+bridge/cs_bridge.cpp           engine ABI implementation (uses bridge/common/cs_common.hpp)
+bridge/common/                 engine-neutral job parsing + fast strtod (same files in orcaslicer-wasm)
+toolchain/                     bootstrap + dependency build (see toolchain/README.md)
 bridge/CMakeLists.txt          the `slicer` target -> slicer.mjs + slicer.wasm, link flags
 scripts/build-wasm.sh          patch + configure + build + schema generation
 scripts/gen-schema.mjs         writes schema.json / version.json from the built module
@@ -26,21 +28,23 @@ tests/cs-slice-test.mjs        end-to-end + robustness tests (release and debug 
 
 ## Building
 
-Prerequisites (shared with the Orca port): `../wasm-deps` with the toolchain
-and dependency prefix, and a preFlight checkout at `../preflight`:
+Prerequisites: the toolchain and dependency prefix (`toolchain/`, or a shared
+`../wasm-deps` checkout used by both ports) and preFlight v1.3.0 at
+`../preflight` (the build script clones it when missing):
 
 ```bash
-bash ../wasm-deps/build-deps.sh all               # Eigen, CGAL, cereal, GMP/MPFR, NLopt, Boost, ...
-bash ../wasm-deps/build-deps.sh preflight-extras  # Qhull, expat, heatshrink, nlohmann_json, nanosvg
-git -C ../preflight checkout v1.3.0
+bash toolchain/bootstrap.sh                          # emsdk 6.0.10, CMake, Ninja, m4
+bash toolchain/build-deps.sh all                     # Eigen, CGAL, cereal, GMP/MPFR, NLopt, Boost, ...
+bash toolchain/build-deps.sh preflight-extras        # Qhull, expat, heatshrink, nlohmann_json, nanosvg
 
 bash scripts/build-wasm.sh                        # release -> build-release/
 BUILD_VARIANT=debug bash scripts/build-wasm.sh    # debug   -> build-debug/  (-O1 -g2 SAFE_HEAP ASSERTIONS=2)
 node tests/cs-slice-test.mjs                      # runs against every build dir that exists
+node tests/cs-features-test.mjs                   # paint, variable layer height, height ranges, custom G-code
 ```
 
 `NPROC` (default 3) caps parallel compile jobs; ccache is used when on PATH
-(`wasm-deps/env.sh` sets it up). The script applies the patch idempotently and
+(`toolchain/env.sh` sets it up). The script applies the patch idempotently and
 refuses to build if the checkout has diverged from it.
 
 Artifacts (`build-<variant>/`):

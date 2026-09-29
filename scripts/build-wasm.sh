@@ -12,7 +12,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFLIGHT_SRC="${PREFLIGHT_SRC:-$ROOT/../preflight}"
-WASM_DEPS="${WASM_DEPS:-$ROOT/../wasm-deps}"
+# Toolchain: a shared ../wasm-deps checkout when present, else ./toolchain (see toolchain/README.md).
+if [[ -z "${WASM_DEPS:-}" ]]; then
+    if [[ -f "$ROOT/../wasm-deps/env.sh" ]]; then WASM_DEPS="$ROOT/../wasm-deps"; else WASM_DEPS="$ROOT/toolchain"; fi
+fi
 PATCH_FILE="$ROOT/patches/preflight-wasm.patch"
 PREFLIGHT_TAG="v1.3.0"
 VARIANT="${BUILD_VARIANT:-release}"
@@ -36,7 +39,10 @@ for f in libboost_log.a libqhullstatic_r.a libexpat.a libheatshrink_dynalloc.a l
 done
 
 # --- preFlight checkout + patch (idempotent) ---------------------------------
-[[ -d "$PREFLIGHT_SRC/.git" ]] || { echo "preFlight checkout not found at $PREFLIGHT_SRC (git clone https://github.com/oozebot/preFlight)" >&2; exit 1; }
+if [[ ! -d "$PREFLIGHT_SRC/.git" ]]; then
+    echo "cloning preFlight $PREFLIGHT_TAG into $PREFLIGHT_SRC"
+    git clone --depth 1 --branch "$PREFLIGHT_TAG" https://github.com/oozebot/preFlight.git "$PREFLIGHT_SRC"
+fi
 head_tag="$(git -C "$PREFLIGHT_SRC" describe --tags --exact-match 2>/dev/null || true)"
 if [[ "$head_tag" != "$PREFLIGHT_TAG" ]]; then
     echo "WARN: $PREFLIGHT_SRC is at '${head_tag:-$(git -C "$PREFLIGHT_SRC" rev-parse --short HEAD)}', expected $PREFLIGHT_TAG" >&2
@@ -61,7 +67,7 @@ fi
 if [[ ! -f "$BUILD_DIR/build.ninja" ]]; then
     emcmake cmake -S "$ROOT/wasm" -B "$BUILD_DIR" -G Ninja \
         -DBUILD_VARIANT="$VARIANT" -DPREFLIGHT_SRC="$PREFLIGHT_SRC" \
-        -DWASM_DEPS_PREFIX="$WASM_DEPS_PREFIX" -DWASM_BRIDGE_DIR="$ROOT/../wasm-bridge" \
+        -DWASM_DEPS_PREFIX="$WASM_DEPS_PREFIX" -DWASM_BRIDGE_DIR="$ROOT/bridge/common" \
         "${LAUNCHER[@]}"
 fi
 cmake --build "$BUILD_DIR" --target slicer -j"$JOBS"

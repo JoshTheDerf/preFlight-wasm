@@ -230,7 +230,8 @@ void report_apply_log(json &report, const ApplyLog &log)
 // Mesh-local vertices → bed coordinates. The host already flips the winding
 // of mirrored transforms (see ENGINE-CONTRACT.md), so indices are used as
 // given; an inside-out result is corrected via the signed volume.
-TriangleMesh make_mesh(std::vector<float> &positions, std::vector<uint32_t> &indices, const double *t, const std::string &name)
+TriangleMesh make_mesh(std::vector<float> &positions, std::vector<uint32_t> &indices, const double *t, const std::string &name,
+                       std::vector<int> *tri_map = nullptr)
 {
     const size_t nv = positions.size() / 3;
     indexed_triangle_set its;
@@ -258,7 +259,19 @@ TriangleMesh make_mesh(std::vector<float> &positions, std::vector<uint32_t> &ind
     std::vector<float>().swap(positions);
     std::vector<uint32_t>().swap(indices);
 
-    its_remove_degenerate_faces(its);
+    // Drop degenerate faces (like its_remove_degenerate_faces) but remember the
+    // renumbering: painted facets are addressed by the host's triangle index.
+    {
+        size_t k = 0;
+        if (tri_map) tri_map->assign(its.indices.size(), -1);
+        for (size_t i = 0; i < its.indices.size(); ++i) {
+            const auto &f = its.indices[i];
+            if (f(0) == f(1) || f(0) == f(2) || f(1) == f(2)) continue;
+            if (tri_map) (*tri_map)[i] = int(k);
+            its.indices[k++] = f;
+        }
+        its.indices.resize(k);
+    }
     if (its.indices.empty())
         throw cs::JobError(name + ": mesh has no non-degenerate triangles");
     its_compactify_vertices(its);
@@ -415,6 +428,65 @@ int apply_placeholder_vars(Print &print, const json &vars)
     return n;
 }
 
+// Painted facets (Orca / PrusaSlicer 3MF per-triangle hex strings), host triangle
+// index → mesh triangle via tri_map. Layers: support, seam, color (MMU), fuzzy.
+int apply_paint(ModelVolume *mv, const json &paint, const std::vector<int> &tri_map)
+{
+    if (!paint.is_object() || paint.empty()) return 0;
+    const int n_tris = int(mv->mesh().its.indices.size());
+    int n = 0;
+    auto load = [&](const char *key, FacetsAnnotation &fa) {
+        auto it = paint.find(key);
+        if (it == paint.end() || !it->is_array()) return;
+        fa.reserve(int(it->size()));
+        for (const json &e : *it) {
+            if (!e.is_array() || e.size() != 2 || !e[0].is_number_integer() || !e[1].is_string()) continue;
+            const int host = e[0].get<int>();
+            if (host < 0 || host >= int(tri_map.size())) continue;
+            const int tri = tri_map[size_t(host)];
+            if (tri < 0 || tri >= n_tris) continue;
+            const std::string &str = e[1].get_ref<const std::string &>();
+            if (str.empty() || str.size() > 1u << 20) continue;
+            fa.set_triangle_from_string(tri, str);
+            ++n;
+        }
+        fa.shrink_to_fit();
+    };
+    load("support", mv->supported_facets);
+    load("seam", mv->seam_facets);
+    load("color", mv->mm_segmentation_facets);
+    load("fuzzy", mv->fuzzy_skin_facets);
+    return n;
+}
+
+void apply_layer_settings(ModelObject *mo, const cs::MeshInput &m, const DynamicPrintConfig &config, ApplyLog &log)
+{
+    // Variable layer height: [z0, h0, z1, h1, ...] from the object's bottom.
+    const auto &prof = m.layer_height_profile;
+    if (prof.size() >= 4 && prof.size() % 2 == 0) {
+        bool ok = true;
+        for (size_t i = 0; i < prof.size(); ++i) ok = ok && std::isfinite(prof[i]) && (i % 2 == 0 || prof[i] > 0);
+        if (ok) mo->layer_height_profile.set(std::vector<coordf_t>(prof.begin(), prof.end()));
+    }
+    // Height range modifiers: every range needs a layer height (it defaults to the print's).
+    if (m.layer_ranges.is_array()) {
+        const double default_lh = config.opt_float("layer_height");
+        double last_max = -1e30;
+        std::vector<std::pair<t_layer_height_range, json>> ranges;
+        for (const json &r : m.layer_ranges)
+            if (r.is_object() && r.contains("min") && r.contains("max") && r["min"].is_number() && r["max"].is_number())
+                ranges.push_back({{r["min"].get<double>(), r["max"].get<double>()}, r.value("config", json::object())});
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+        for (auto &[range, cfg] : ranges) {
+            if (!(range.second > range.first) || range.first < last_max - EPSILON) continue; // empty / overlapping: skipped
+            last_max = range.second;
+            ModelConfig &mc = mo->layer_config_ranges[range];
+            if (cfg.is_object() && !cfg.empty()) apply_json_config(mc, cfg, log, m.name + ".range.");
+            if (!mc.has("layer_height")) mc.set_key_value("layer_height", new ConfigOptionFloat(default_lh));
+        }
+    }
+}
+
 // ---------------------------------------------------------------- slicing
 int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_len, std::string &gcode, json &report)
 {
@@ -432,8 +504,10 @@ int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_
     for (cs::MeshInput &m : job.objects) {
         ModelObject *mo = model.add_object();
         mo->name = m.name;
-        ModelVolume *mv = mo->add_volume(make_mesh(m.positions, m.indices, m.transform, m.name));
+        std::vector<int> tri_map;
+        ModelVolume *mv = mo->add_volume(make_mesh(m.positions, m.indices, m.transform, m.name, &tri_map));
         mv->name = m.name;
+        apply_paint(mv, m.paint, tri_map);
         // Extra volumes: parts, negative parts, modifiers, support blockers / enforcers.
         for (cs::VolumeInput &p : m.parts) {
             const ModelVolumeType type = p.type == "negative"         ? ModelVolumeType::NEGATIVE_VOLUME
@@ -441,8 +515,10 @@ int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_
                                        : p.type == "support_blocker"  ? ModelVolumeType::SUPPORT_BLOCKER
                                        : p.type == "support_enforcer" ? ModelVolumeType::SUPPORT_ENFORCER
                                                                       : ModelVolumeType::MODEL_PART;
-            ModelVolume *pv = mo->add_volume(make_mesh(p.positions, p.indices, p.transform, p.name), type);
+            std::vector<int> ptri;
+            ModelVolume *pv = mo->add_volume(make_mesh(p.positions, p.indices, p.transform, p.name, &ptri), type);
             pv->name = p.name;
+            if (type == ModelVolumeType::MODEL_PART) apply_paint(pv, p.paint, ptri);
             if (!p.config.empty()) {
                 ApplyLog vlog;
                 apply_json_config(pv->config, p.config, vlog, p.name + ".");
@@ -461,11 +537,33 @@ int slice_impl(const char *job_json, int job_len, const uint8_t *blob, int blob_
             for (auto &k : olog.unknown)
                 log.unknown.push_back(k);
         }
+        apply_layer_settings(mo, m, config, log);
         mo->invalidate_bounding_box();
         if (job.drop_to_bed)
             mo->ensure_on_bed();
     }
     report_apply_log(report, log);
+
+    // Plate custom G-code (preview layer slider: colour changes, pauses, custom, templates).
+    if (!job.custom_gcodes.empty()) {
+        CustomGCode::Info info;
+        const size_t extruders = config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+        info.mode = extruders > 1 ? CustomGCode::MultiAsSingle : CustomGCode::SingleExtruder;
+        for (const json &g : job.custom_gcodes) {
+            if (!g.is_object() || !g.contains("z") || !g["z"].is_number()) continue;
+            CustomGCode::Item it;
+            it.print_z = g["z"].get<double>();
+            const std::string t = g.value("type", std::string("color_change"));
+            it.type = t == "pause" ? CustomGCode::PausePrint : t == "custom" ? CustomGCode::Custom
+                    : t == "tool_change" ? CustomGCode::ToolChange : t == "template" ? CustomGCode::Template : CustomGCode::ColorChange;
+            it.extruder = g.value("extruder", 1);
+            it.color = g.value("color", std::string());
+            it.extra = g.value("extra", std::string());
+            info.gcodes.push_back(it);
+        }
+        std::sort(info.gcodes.begin(), info.gcodes.end());
+        model.custom_gcode_per_print_z() = info;
+    }
 
     // Same as the preFlight CLI: instances not fully inside the build volume are not printed.
     {

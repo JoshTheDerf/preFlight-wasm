@@ -1,0 +1,85 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # tag pushes publish a release
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: System packages
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends build-essential m4 xz-utils unzip curl git python3 ccache
+
+      - name: Cache toolchain
+        id: tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain/emsdk
+            toolchain/cmake
+            toolchain/tools
+          key: tools-${{ runner.os }}-${{ hashFiles('toolchain/bootstrap.sh') }}
+      - name: Bootstrap toolchain
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: bash toolchain/bootstrap.sh
+
+      - name: Cache dependencies
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain/install
+            toolchain/cgal-5.6.3
+            toolchain/cgal-6.1
+          key: deps-${{ runner.os }}-${{ hashFiles('toolchain/build-deps.sh', 'toolchain/env.sh', 'toolchain/bootstrap.sh') }}
+      - name: Build dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: NPROC=4 bash toolchain/build-deps.sh all && NPROC=4 bash toolchain/build-deps.sh preflight-extras
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/ccache-cache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Build engine
+        run: NPROC=4 bash scripts/build-wasm.sh
+
+      - name: Test
+        run: |
+          node tests/cs-slice-test.mjs build-release
+          node tests/cs-features-test.mjs build-release
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build-release/slicer.mjs build-release/slicer.wasm build-release/schema.json build-release/version.json dist/
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preflight-wasm-${{ github.sha }}
+          path: dist/
+          retention-days: 30
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

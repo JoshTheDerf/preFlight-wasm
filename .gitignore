@@ -66,3 +66,4 @@ slicer.cjs
 /toolchain/logs-mt/
 /toolchain/ccache-cache/
 /toolchain/*.log
+/toolchain/cgal-*/

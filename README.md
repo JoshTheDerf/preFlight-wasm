@@ -2,7 +2,7 @@
 
 A WebAssembly build of [preFlight](https://github.com/oozebot/preFlight)
 **v1.3.0** (a PrusaSlicer derivative), packaged as a slicing engine for
-[Cubby Slicer](../../cubby-slicer). It implements the engine-neutral C ABI in
+[Cubby Slicer](https://github.com/JoshTheDerf/cubbyslicer), the browser slicer that goes with the [CubbyCAD editor](https://cubbycad.com/editor). It implements the engine-neutral C ABI in
 `cubby-slicer/docs/ENGINE-CONTRACT.md` (`cs_version`, `cs_describe_config`,
 `cs_slice`, `cs_eval_condition`, `cs_free`).
 
